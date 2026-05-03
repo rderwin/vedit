@@ -58,35 +58,111 @@ TITLE_FADE = 0.4
 TITLE_HOLD = 2.2
 TITLE_TOTAL = TITLE_FADE * 2 + TITLE_HOLD  # 3.0s
 
-COLOR_GRADE = "eq=contrast=1.05:saturation=1.10:gamma=1.02,unsharp=5:5:0.6:5:5:0.0"
+LOOKS = {
+    # Default — subtle pop, leaves the source mostly alone.
+    "default":   "eq=contrast=1.05:saturation=1.10:gamma=1.02,"
+                 "unsharp=5:5:0.6:5:5:0.0",
+    # Cinematic — teal-orange-ish, slight contrast crush.
+    "cinematic": "eq=contrast=1.12:saturation=1.05:gamma=0.98,"
+                 "colorchannelmixer=rr=1.04:bb=0.92,"
+                 "unsharp=5:5:0.5:5:5:0.0",
+    # Warm — sunset / vlog warmth.
+    "warm":      "eq=contrast=1.06:saturation=1.10:gamma=1.02,"
+                 "colorchannelmixer=rr=1.08:gg=1.02:bb=0.90,"
+                 "unsharp=5:5:0.4:5:5:0.0",
+    # Cool — bluish, late-night / gameplay.
+    "cool":      "eq=contrast=1.06:saturation=1.05:gamma=1.0,"
+                 "colorchannelmixer=rr=0.92:bb=1.10,"
+                 "unsharp=5:5:0.4:5:5:0.0",
+    # Black-and-white — high-contrast docu look.
+    "bw":        "eq=contrast=1.15:saturation=0:gamma=0.98,"
+                 "format=gray,format=yuv420p,"
+                 "unsharp=5:5:0.5:5:5:0.0",
+    # Vibrant — pushed saturation for gameplay / sports.
+    "vibrant":   "eq=contrast=1.10:saturation=1.30:gamma=1.04,"
+                 "unsharp=5:5:0.8:5:5:0.0",
+    # Punchy — flat-er but high-contrast, podcast-friendly.
+    "punchy":    "eq=contrast=1.18:saturation=1.0:gamma=0.98,"
+                 "unsharp=5:5:0.6:5:5:0.0",
+}
+
 LOUDNORM_CLIP = "loudnorm=I=-14:TP=-1.5:LRA=11"
 LOUDNORM_MAIN = "loudnorm=I=-16:TP=-1.5:LRA=11"
+
+# xfade transition catalog — accepted by ffmpeg's `xfade` filter. Listed so
+# the SKILL.md and EDL author know what's available without diving into ffmpeg
+# docs. Also used for validation.
+XFADE_TRANSITIONS = {
+    "fade", "fadeblack", "fadewhite", "fadegrays",
+    "wipeleft", "wiperight", "wipeup", "wipedown",
+    "wipetl", "wipetr", "wipebl", "wipebr",
+    "slideleft", "slideright", "slideup", "slidedown",
+    "smoothleft", "smoothright", "smoothup", "smoothdown",
+    "circleopen", "circleclose", "circlecrop",
+    "rectcrop", "distance",
+    "vertopen", "vertclose", "horzopen", "horzclose",
+    "diagtl", "diagtr", "diagbl", "diagbr",
+    "hlslice", "hrslice", "vuslice", "vdslice",
+    "dissolve", "pixelize", "radial",
+    "hblur", "squeezeh", "squeezev",
+    "zoomin",
+}
 
 # Style presets bundle a coherent look. Per-key options in style{} override.
 PRESETS = {
     "default": {
         "vertical_fit": "blur_fill",
         "caption_style": "minimal",
+        "caption_mode": "phrase",
         "title_anim": "fade",
+        "look": "default",
         "use_music": True,   # only kicks in if a music file is present
+        "main_transition": "fade",
     },
     "tiktok": {
         "vertical_fit": "blur_fill",
         "caption_style": "pop",
+        "caption_mode": "word",
         "title_anim": "slide",
+        "look": "vibrant",
         "use_music": True,
+        "main_transition": "fade",
     },
     "gameplay": {
         "vertical_fit": "fill_height",
         "caption_style": "pop",
+        "caption_mode": "word",
         "title_anim": "slide",
+        "look": "vibrant",
         "use_music": True,
+        "main_transition": "slideleft",
     },
     "podcast": {
         "vertical_fit": "blur_fill",
         "caption_style": "bold",
+        "caption_mode": "phrase",
         "title_anim": "fade",
+        "look": "warm",
         "use_music": True,
+        "main_transition": "fade",
+    },
+    "cinematic": {
+        "vertical_fit": "blur_fill",
+        "caption_style": "minimal",
+        "caption_mode": "phrase",
+        "title_anim": "fade",
+        "look": "cinematic",
+        "use_music": True,
+        "main_transition": "fadeblack",
+    },
+    "documentary": {
+        "vertical_fit": "blur_fill",
+        "caption_style": "bold",
+        "caption_mode": "phrase",
+        "title_anim": "fade",
+        "look": "bw",
+        "use_music": True,
+        "main_transition": "fadeblack",
     },
 }
 
@@ -137,19 +213,86 @@ def probe_dims(src):
     return int(w), int(h)
 
 
-def caption_chunks_for(transcript, start, end, max_words=4, min_dur=0.7):
-    """Find transcript phrases that fall inside [start, end].
+FILLERS = {
+    "um", "uh", "uhh", "um,", "uh,", "uhh,",
+    "like,", "like.",
+    "you", "know,",          # "you know,"
+    "i", "mean,",            # "i mean,"
+    "kinda,", "kind", "of,", # "kind of"
+    "sort", "sorta,",
+    "literally,",
+}
 
-    Returns a list of {start, end, text} relative to the *clip*, where
-    each chunk is at most `max_words` long and lasts at least `min_dur`.
+
+def caption_chunks_for(
+    transcript,
+    start,
+    end,
+    *,
+    max_words=4,
+    min_dur=0.7,
+    mode="phrase",
+    drop_fillers=False,
+    max_chunks=80,
+):
+    """Find transcript phrases inside [start, end] and chunk them for captions.
+
+    `mode='phrase'` — group into ≤max_words chunks (current default).
+    `mode='word'`   — one word per chunk, TikTok-2024 style. Caps at
+                      `max_chunks` words; falls back to phrase mode if the
+                      clip is too word-dense for ffmpeg's filter graph.
     """
     in_range = [t for t in transcript if start <= t["start"] < end]
     if not in_range:
         return []
+
+    if mode == "word":
+        # Distribute each phrase's duration evenly across its words.
+        words = []
+        for i, entry in enumerate(in_range):
+            next_start = in_range[i + 1]["start"] if i + 1 < len(in_range) else end
+            ws = entry["text"].split()
+            if not ws:
+                continue
+            wdur = (next_start - entry["start"]) / len(ws)
+            for k, w in enumerate(ws):
+                t0 = entry["start"] + k * wdur - start
+                if drop_fillers and _is_filler(w):
+                    continue
+                words.append({
+                    "start": max(0.0, t0),
+                    "end": min(end - start, t0 + wdur),
+                    "text": w,
+                })
+        # Filter graph explodes on >max_chunks overlays; fall back gracefully.
+        if len(words) > max_chunks:
+            print(
+                "[captions] {} words in clip exceeds cap {} — falling back "
+                "to phrase mode".format(len(words), max_chunks)
+            )
+            return caption_chunks_for(
+                transcript, start, end,
+                max_words=max_words, min_dur=min_dur,
+                mode="phrase", drop_fillers=drop_fillers,
+                max_chunks=max_chunks,
+            )
+        # Ensure each word is on screen for at least min_dur.
+        out = []
+        for w in words:
+            if w["end"] - w["start"] < min_dur:
+                w["end"] = w["start"] + min_dur
+            out.append(w)
+        return out
+
+    # phrase mode (default)
     chunks = []
     for i, entry in enumerate(in_range):
         next_start = in_range[i + 1]["start"] if i + 1 < len(in_range) else end
         words = entry["text"].split()
+        if drop_fillers:
+            words = [w for w in words if not _is_filler(w)]
+            if not words:
+                continue
         # split a long phrase into max_words chunks, divvying duration evenly
         sub_n = max(1, (len(words) + max_words - 1) // max_words)
         slice_dur = (next_start - entry["start"]) / sub_n
@@ -175,6 +318,10 @@ def caption_chunks_for(transcript, start, end, max_words=4, min_dur=0.7):
     return out
 
 
+def _is_filler(word):
+    return word.lower().strip(".,!?;:") in {"um", "uh", "uhh", "uhm", "er"}
+
+
 def render_clip(
     src,
     start,
@@ -191,6 +338,11 @@ def render_clip(
     caption_style="minimal",
     title_anim="fade",
     accent="#FFD24A",
+    look="default",
+    logo_path=None,
+    logo_position="top_right",
+    logo_opacity=0.85,
+    logo_scale=0.10,
 ):
     """Render one polished clip. Returns the output path."""
     dur = end - start
@@ -204,11 +356,12 @@ def render_clip(
 
     # Build the video filter chain on stream [0:v]. Filters within a chain
     # flow with commas; chains are separated with semicolons.
+    color_grade = LOOKS.get(look, LOOKS["default"])
     if vertical:
         fit_filter = VERT_FITS.get(vertical_fit, VERT_BLUR_FILL)
-        full_chain = "[0:v]" + COLOR_GRADE + "," + fit_filter
+        full_chain = "[0:v]" + color_grade + "," + fit_filter
     else:
-        full_chain = "[0:v]" + COLOR_GRADE + "[base]"
+        full_chain = "[0:v]" + color_grade + "[base]"
 
     inputs = ["-i", str(src)]
     overlays = ["[base]"]
@@ -246,6 +399,7 @@ def render_clip(
 
     # Title overlay. Always uses an alpha fade; `title_anim="slide"` adds a
     # slide-in from the left + slide-out to the left, combined with the fade.
+    pre_logo_label = "[v_pre_logo]"
     if title:
         title_png = work_assets / "title.png"
         img = render_title_card(title, out_w, out_h, accent=accent)
@@ -254,8 +408,6 @@ def render_clip(
         prev_label = overlays[-1]
         out_st = TITLE_FADE + TITLE_HOLD
         if title_anim == "slide":
-            # x ramps -w → 0 over [0, TITLE_FADE], holds at 0 during HOLD,
-            # then 0 → -w over [out_st, out_st+TITLE_FADE].
             x_expr = (
                 "if(lt(t\\,{f}),-w*({f}-t)/{f},"
                 "if(gt(t\\,{out_st}),-w*(t-{out_st})/{f},0))"
@@ -268,7 +420,7 @@ def render_clip(
             "fade=t=in:st=0:d={f}:alpha=1,"
             "fade=t=out:st={out_st}:d={f}:alpha=1[ttl];"
             "{prev}[ttl]overlay={ox}:y=0:format=auto:"
-            "enable='between(t,0,{total})'[v]"
+            "enable='between(t,0,{total})'{pl}"
         ).format(
             idx=next_input_idx,
             f=TITLE_FADE,
@@ -276,11 +428,42 @@ def render_clip(
             total=TITLE_TOTAL,
             prev=prev_label,
             ox=overlay_x,
+            pl=pre_logo_label,
         )
         next_input_idx += 1
     else:
-        # rename last label to [v]
-        full_chain += ";{}null[v]".format(overlays[-1])
+        full_chain += ";{}null{}".format(overlays[-1], pre_logo_label)
+
+    # Logo overlay (always-on watermark in a corner). Drop logo.png in the
+    # workdir and the assembler scales + positions it at `logo_position`.
+    if logo_path:
+        # Logo PNG: scale to logo_scale * out_w wide (preserve aspect), then
+        # apply opacity by chaining through `colorchannelmixer` on the alpha.
+        logo_w = max(40, int(out_w * logo_scale))
+        # Padding from frame edge.
+        edge_pad = max(20, int(out_w * 0.022))
+        positions = {
+            "top_right":    "x=W-w-{p}:y={p}".format(p=edge_pad),
+            "top_left":     "x={p}:y={p}".format(p=edge_pad),
+            "bottom_right": "x=W-w-{p}:y=H-h-{p}".format(p=edge_pad),
+            "bottom_left":  "x={p}:y=H-h-{p}".format(p=edge_pad),
+        }
+        ovl_pos = positions.get(logo_position, positions["top_right"])
+        inputs += png_input_prefix + ["-i", str(logo_path)]
+        full_chain += (
+            ";[{idx}:v]scale={lw}:-2,format=rgba,"
+            "colorchannelmixer=aa={op}[logo];"
+            "{pl}[logo]overlay={pos}:format=auto[v]"
+        ).format(
+            idx=next_input_idx,
+            lw=logo_w,
+            op=logo_opacity,
+            pl=pre_logo_label,
+            pos=ovl_pos,
+        )
+        next_input_idx += 1
+    else:
+        full_chain += ";{}null[v]".format(pre_logo_label)
 
     # Audio: short fade in/out, optional loudnorm (skip on parts that will
     # be normalized after concat to avoid double-normalization).
@@ -310,11 +493,12 @@ def render_clip(
     return out
 
 
-def assemble_main(parts, out, durations, xfade=0.5, music_path=None):
+def assemble_main(parts, out, durations, xfade=0.5, music_path=None,
+                  transitions=None):
     """Concatenate `parts` (mp4 paths) with xfade + acrossfade transitions.
 
-    If `music_path` is given, the music is looped, ducked under the voice
-    via `sidechaincompress`, and mixed in. Final loudnorm pass either way.
+    `transitions[i]` is the xfade type to use *between part i-1 and part i*.
+    Index 0 is unused. Defaults to "fade" everywhere.
     """
     inputs = []
     for p in parts:
@@ -344,13 +528,17 @@ def assemble_main(parts, out, durations, xfade=0.5, music_path=None):
     a_label = "[0:a]"
     chain_parts = []
     cumulative = durations[0]
+    transitions = transitions or []
     for i in range(1, len(parts)):
         offset = cumulative - xfade
         new_v = "[v{}]".format(i)
         new_a = "[a{}]".format(i)
+        tname = transitions[i] if i < len(transitions) and transitions[i] else "fade"
+        if tname not in XFADE_TRANSITIONS:
+            tname = "fade"
         chain_parts.append(
-            "{prev}[{i}:v]xfade=transition=fade:duration={d}:offset={o}{nv}".format(
-                prev=v_label, i=i, d=xfade, o=round(offset, 3), nv=new_v,
+            "{prev}[{i}:v]xfade=transition={t}:duration={d}:offset={o}{nv}".format(
+                prev=v_label, i=i, t=tname, d=xfade, o=round(offset, 3), nv=new_v,
             )
         )
         chain_parts.append(
@@ -433,16 +621,20 @@ def main():
 
     default_vertical_fit = style_get("vertical_fit")
     default_caption_style = style_get("caption_style")
+    default_caption_mode = style_get("caption_mode")
     default_title_anim = style_get("title_anim")
     default_use_music = style_get("use_music")
+    default_look = style_get("look")
+    default_main_transition = style_get("main_transition")
     default_accent = style.get("accent", "#FFD24A")
+    drop_fillers = bool(style.get("drop_fillers", False))
 
     if default_vertical_fit not in VERT_FITS:
-        sys.exit(
-            "unknown vertical_fit: {!r} (valid: {})".format(
-                default_vertical_fit, ", ".join(sorted(VERT_FITS))
-            )
-        )
+        sys.exit("unknown vertical_fit: {!r} (valid: {})".format(
+            default_vertical_fit, ", ".join(sorted(VERT_FITS))))
+    if default_look not in LOOKS:
+        sys.exit("unknown look: {!r} (valid: {})".format(
+            default_look, ", ".join(sorted(LOOKS))))
 
     # Music detection: look for music.<ext> in the workdir.
     music_path = None
@@ -452,13 +644,25 @@ def main():
             if p.exists():
                 music_path = p
                 break
+
+    # Logo detection: look for logo.png / logo.jpg in the workdir.
+    logo_path = None
+    for name in ("logo.png", "logo.PNG", "logo.jpg"):
+        p = workdir / name
+        if p.exists():
+            logo_path = p
+            break
+    logo_position = style.get("logo_position", "top_right")
+    logo_opacity = float(style.get("logo_opacity", 0.85))
+    logo_scale = float(style.get("logo_scale", 0.10))
+
     print(
-        "[style] preset={} vfit={} caps={} title={} music={}".format(
-            preset_name,
-            default_vertical_fit,
-            default_caption_style,
+        "[style] preset={} look={} vfit={} caps={}/{} title={} music={} logo={}".format(
+            preset_name, default_look, default_vertical_fit,
+            default_caption_style, default_caption_mode,
             default_title_anim,
             music_path.name if music_path else "off",
+            logo_path.name if logo_path else "off",
         )
     )
 
@@ -475,6 +679,7 @@ def main():
     if main_segs:
         parts = []
         durations = []
+        transitions = [None]  # index 0 unused; one entry per segment.
         for i, seg in enumerate(main_segs):
             assets = tmp_dir / "main_{:03d}_assets".format(i)
             assets.mkdir(exist_ok=True)
@@ -492,11 +697,19 @@ def main():
                 is_main_part=True,
                 title_anim=default_title_anim,
                 accent=default_accent,
+                look=default_look,
+                logo_path=logo_path,
+                logo_position=logo_position,
+                logo_opacity=logo_opacity,
+                logo_scale=logo_scale,
             )
             parts.append(part)
             durations.append(float(seg["end"]) - float(seg["start"]))
+            # transition[i] = transition INTO segment i (used between i-1 and i)
+            transitions.append(seg.get("transition", default_main_transition))
         main_out = out_dir / "main.mp4"
-        assemble_main(parts, main_out, durations, music_path=music_path)
+        assemble_main(parts, main_out, durations,
+                      music_path=music_path, transitions=transitions)
         print("main → {}".format(main_out))
 
     # ---- clips ----
@@ -516,8 +729,10 @@ def main():
         do_caps = clip.get("captions", caps_default) and transcript
 
         cap_style = clip.get("caption_style", default_caption_style)
+        cap_mode = clip.get("caption_mode", default_caption_mode)
         t_anim = clip.get("title_anim", default_title_anim)
         accent = clip.get("accent", default_accent)
+        look = clip.get("look", default_look)
 
         # landscape version
         assets_l = tmp_dir / "clip_{:02d}_l".format(i)
@@ -531,6 +746,11 @@ def main():
             work_assets=assets_l,
             title_anim=t_anim,
             accent=accent,
+            look=look,
+            logo_path=logo_path,
+            logo_position=logo_position,
+            logo_opacity=logo_opacity,
+            logo_scale=logo_scale,
         )
         print("clip → {}".format(clips_dir / name))
 
@@ -538,7 +758,12 @@ def main():
             vert_dir.mkdir(exist_ok=True)
             assets_v = tmp_dir / "clip_{:02d}_v".format(i)
             assets_v.mkdir(exist_ok=True)
-            caps = caption_chunks_for(transcript, start, end) if do_caps else None
+            caps = (
+                caption_chunks_for(
+                    transcript, start, end,
+                    mode=cap_mode, drop_fillers=drop_fillers,
+                ) if do_caps else None
+            )
             v_fit = clip.get("vertical_fit", default_vertical_fit)
             render_clip(
                 src, start, end, vert_dir / name,
@@ -551,6 +776,11 @@ def main():
                 caption_style=cap_style,
                 title_anim=t_anim,
                 accent=accent,
+                look=look,
+                logo_path=logo_path,
+                logo_position=logo_position,
+                logo_opacity=logo_opacity,
+                logo_scale=logo_scale,
             )
             print("clip → {}".format(vert_dir / name))
 
