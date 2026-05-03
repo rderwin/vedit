@@ -33,13 +33,22 @@ Produces `<workdir>/source.mp4`, `<workdir>/source.en.vtt`, `<workdir>/source.in
 
 For a still-live stream, edit the script to add `--live-from-start` or wait for it to end. Past livestreams (VODs) work as-is.
 
-### 2. Parse transcript
+### 2. Get a transcript
+
+If the download produced `source.en.vtt` (or `source.en-*.vtt`), parse it:
 
 ```bash
 python3 .claude/skills/youtube-edit/scripts/parse_transcript.py <workdir>
 ```
 
-Writes `<workdir>/transcript.json` — `[{start, text}, ...]`, deduped from rolling auto-captions to one entry per new phrase.
+If no VTT was downloaded — common for fresh livestream uploads where YouTube hasn't generated auto-captions yet — fall back to whisper.cpp:
+
+```bash
+bash .claude/skills/youtube-edit/scripts/transcribe.sh <workdir>
+python3 .claude/skills/youtube-edit/scripts/parse_transcript.py <workdir>
+```
+
+Both paths produce `<workdir>/transcript.json` — `[{start, text}, ...]`. The whisper path takes ~1/10× to ~1/3× real-time on Apple Silicon with the `base.en` model (a 100-min stream → 5–15 min).
 
 ### 3. Analyze signals
 
@@ -169,13 +178,18 @@ Tell the user where the files are. Give each clip a one-line pitch ("Clip 03 —
 
 ## Requirements
 
-- `yt-dlp` — install with `uv tool install yt-dlp`. The download script puts `~/.local/bin` on PATH so a uv-installed yt-dlp is found.
-- `ffmpeg` — install with `brew install ffmpeg`. The polish pipeline uses `eq`, `unsharp`, `xfade`, `acrossfade`, `loudnorm`, `fade`, `overlay`, `gblur` — all in the standard build.
+- `yt-dlp` — `uv tool install yt-dlp`. The download script puts `~/.local/bin` on PATH so a uv-installed yt-dlp is found.
+- `ffmpeg` — `brew install ffmpeg`. The polish pipeline uses `eq`, `unsharp`, `xfade`, `acrossfade`, `loudnorm`, `fade`, `overlay`, `gblur` — all in the standard build.
 - `uv` — used by `assemble.py` to provide Pillow on the fly.
+- **For the transcribe fallback only:** `whisper-cpp` (`brew install whisper-cpp`) and a model file at `~/.cache/whisper-cpp/ggml-base.en.bin`. Download with:
+  ```bash
+  mkdir -p ~/.cache/whisper-cpp
+  curl -L -o ~/.cache/whisper-cpp/ggml-base.en.bin \
+    https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
+  ```
 
 ## Not yet implemented
 
-- **No-captions fallback.** If the video has no auto-captions, the transcript step fails. (Future: whisper transcription.)
 - **Auto-upload** to YouTube / TikTok / Shorts. Files land on disk for the user to upload.
 - **Animated transitions on clips.** Clips currently use hard cuts (clean, fast). Could add slide/zoom motion.
 - **Brand intro / outro cards** for the main compilation.
