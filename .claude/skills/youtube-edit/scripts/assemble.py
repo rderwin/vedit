@@ -89,6 +89,20 @@ LOOKS = {
 LOUDNORM_CLIP = "loudnorm=I=-14:TP=-1.5:LRA=11"
 LOUDNORM_MAIN = "loudnorm=I=-16:TP=-1.5:LRA=11"
 
+# Encoder/quality presets.
+QUALITY_PRESETS = {
+    # Fast iteration — lower quality, smaller files, encodes ~2-3x faster.
+    "fast":     {"codec": "libx264", "preset": "veryfast", "crf": "23", "audio_kbps": "160"},
+    # Default — what we shipped before.
+    "balanced": {"codec": "libx264", "preset": "medium",   "crf": "19", "audio_kbps": "192"},
+    # Higher visual quality, bigger files, slower encode.
+    "high":     {"codec": "libx264", "preset": "slow",     "crf": "17", "audio_kbps": "256"},
+    # H.265/HEVC — half the file size at similar quality, slow encode.
+    "h265":     {"codec": "libx265", "preset": "medium",   "crf": "21", "audio_kbps": "192"},
+    # Archival — visually lossless, much bigger files.
+    "archival": {"codec": "libx264", "preset": "slow",     "crf": "14", "audio_kbps": "320"},
+}
+
 # xfade transition catalog — accepted by ffmpeg's `xfade` filter. Listed so
 # the SKILL.md and EDL author know what's available without diving into ffmpeg
 # docs. Also used for validation.
@@ -241,6 +255,16 @@ def slugify(s, fallback="clip"):
 def run(cmd):
     print("+ " + " ".join(shlex.quote(c) for c in cmd))
     subprocess.run(cmd, check=True)
+
+
+def encoder_args(quality="balanced"):
+    """Return ffmpeg `-c:v ... -c:a ...` args for the given quality preset."""
+    q = QUALITY_PRESETS.get(quality, QUALITY_PRESETS["balanced"])
+    return [
+        "-c:v", q["codec"], "-preset", q["preset"], "-crf", q["crf"],
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", q["audio_kbps"] + "k",
+    ]
 
 
 def probe_dims(src):
@@ -404,7 +428,8 @@ def _is_filler(word):
     return word.lower().strip(".,!?;:") in {"um", "uh", "uhh", "uhm", "er"}
 
 
-def export_format(src_mp4, fmt, out_path, *, vertical_fit="blur_fill"):
+def export_format(src_mp4, fmt, out_path, *, vertical_fit="blur_fill",
+                  quality="balanced"):
     """Re-encode `src_mp4` into one of the export formats.
 
     fmt:
@@ -435,13 +460,17 @@ def export_format(src_mp4, fmt, out_path, *, vertical_fit="blur_fill"):
         raise ValueError("unknown export format: " + fmt)
 
     use_complex = fmt == "vertical" and vertical_fit != "fill_height"
+    # The export pass doesn't re-encode audio (already mastered in main).
+    # Take the video portion of encoder_args and override audio with -c:a copy.
+    enc = encoder_args(quality)
+    # Strip the audio args from enc and replace with copy.
+    v_only = enc[:enc.index("-c:a")]
     if use_complex:
         run([
             "ffmpeg", "-y", "-i", str(src_mp4),
             "-filter_complex", "[0:v]" + vf + "[v]",
             "-map", "[v]", "-map", "0:a",
-            "-c:v", "libx264", "-preset", "medium", "-crf", "19",
-            "-pix_fmt", "yuv420p",
+        ] + v_only + [
             "-c:a", "copy",
             "-movflags", "+faststart",
             str(out_path),
@@ -450,15 +479,14 @@ def export_format(src_mp4, fmt, out_path, *, vertical_fit="blur_fill"):
         run([
             "ffmpeg", "-y", "-i", str(src_mp4),
             "-vf", vf,
-            "-c:v", "libx264", "-preset", "medium", "-crf", "19",
-            "-pix_fmt", "yuv420p",
+        ] + v_only + [
             "-c:a", "copy",
             "-movflags", "+faststart",
             str(out_path),
         ])
 
 
-def make_end_card_part(spec, dims, accent, out_path):
+def make_end_card_part(spec, dims, accent, out_path, quality="balanced"):
     """Render a 3–4s end card as an mp4 to use as the last main segment."""
     w, h = dims
     duration = float(spec.get("duration", 3.5))
@@ -476,14 +504,41 @@ def make_end_card_part(spec, dims, accent, out_path):
         "-i", str(png_path),
         "-f", "lavfi", "-t", "{:.3f}".format(duration),
         "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-        "-c:v", "libx264", "-preset", "medium", "-crf", "19",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "192k",
+    ] + encoder_args(quality) + [
         "-shortest", "-movflags", "+faststart",
         str(out_path),
     ])
     png_path.unlink(missing_ok=True)
     return out_path, duration
+
+
+def snap_segments_to_beats(segments, beats, max_shift=1.5):
+    """Adjust each (non-last) segment's end so the next cut lands on a beat.
+
+    Returns a new list of segments (dicts) with `end` shifted by up to
+    ±max_shift seconds when a beat is in range. The cumulative output
+    duration is what gets aligned to the beat grid — the music plays
+    from t=0 of the compilation, so this is also when the audio's
+    downbeat hits.
+    """
+    if not beats or not segments:
+        return segments
+    cumulative = 0.0
+    out = []
+    for i, seg in enumerate(segments):
+        seg = dict(seg)
+        seg_dur = float(seg["end"]) - float(seg["start"])
+        if i < len(segments) - 1:
+            target = cumulative + seg_dur
+            cands = [b for b in beats if abs(b - target) <= max_shift]
+            if cands:
+                nearest = min(cands, key=lambda b: abs(b - target))
+                shift = nearest - target
+                seg["end"] = float(seg["end"]) + shift
+                seg_dur += shift
+        out.append(seg)
+        cumulative += seg_dur
+    return out
 
 
 def _atempo_chain(speed):
@@ -530,6 +585,7 @@ def render_clip(
     zoom_peaks=None,
     stabilize=False,
     face_track=None,
+    quality="balanced",
 ):
     """Render one polished clip. Returns the output path."""
     dur = end - start
@@ -753,9 +809,7 @@ def render_clip(
     ] + inputs + [
         "-filter_complex", full_chain,
         "-map", "[v]", "-map", "[a]",
-        "-c:v", "libx264", "-preset", "medium", "-crf", "19",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "192k",
+    ] + encoder_args(quality) + [
         "-movflags", "+faststart",
         str(out),
     ]
@@ -764,7 +818,7 @@ def render_clip(
 
 
 def assemble_main(parts, out, durations, xfade=0.5, music_path=None,
-                  transitions=None):
+                  transitions=None, quality="balanced"):
     """Concatenate `parts` (mp4 paths) with xfade + acrossfade transitions.
 
     `transitions[i]` is the xfade type to use *between part i-1 and part i*.
@@ -783,11 +837,12 @@ def assemble_main(parts, out, durations, xfade=0.5, music_path=None,
 
     if len(parts) == 1 and music_idx is None:
         # Fast path — single part, no music — keep video stream copy.
+        q = QUALITY_PRESETS.get(quality, QUALITY_PRESETS["balanced"])
         run([
             "ffmpeg", "-y", "-i", str(parts[0]),
             "-c:v", "copy",
             "-af", LOUDNORM_MAIN,
-            "-c:a", "aac", "-b:a", "192k",
+            "-c:a", "aac", "-b:a", q["audio_kbps"] + "k",
             "-movflags", "+faststart",
             str(out),
         ])
@@ -851,9 +906,7 @@ def assemble_main(parts, out, durations, xfade=0.5, music_path=None,
     ] + inputs + [
         "-filter_complex", filter_complex,
         "-map", v_label, "-map", a_label,
-        "-c:v", "libx264", "-preset", "medium", "-crf", "19",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "192k",
+    ] + encoder_args(quality) + [
         "-movflags", "+faststart",
         str(out),
     ])
@@ -901,6 +954,11 @@ def main():
     default_sfx_on_title = bool(style.get("sfx_on_title", False))
     default_auto_zoom = bool(style.get("auto_zoom", False))
     default_stabilize = bool(style.get("stabilize", False))
+    default_quality = style.get("quality", "balanced")
+    if default_quality not in QUALITY_PRESETS:
+        sys.exit("unknown quality preset: {!r} (valid: {})".format(
+            default_quality, ", ".join(sorted(QUALITY_PRESETS))))
+    default_beat_sync = bool(style.get("beat_sync", False))
 
     # Load signals.json (used for auto-zoom peaks).
     signals = {}
@@ -913,6 +971,12 @@ def main():
     ftpath = workdir / "crop_track.json"
     if ftpath.exists():
         face_track = json.loads(ftpath.read_text())
+
+    # Load beats.json if it exists (used by style.beat_sync).
+    beats = None
+    bpath = workdir / "beats.json"
+    if bpath.exists():
+        beats = json.loads(bpath.read_text()).get("beats") or []
 
     if default_vertical_fit not in VERT_FITS:
         sys.exit("unknown vertical_fit: {!r} (valid: {})".format(
@@ -982,6 +1046,15 @@ def main():
 
     # ---- main compilation ----
     main_segs = (edl.get("main") or {}).get("segments") or []
+    if main_segs and default_beat_sync and beats:
+        snapped = snap_segments_to_beats(main_segs, beats)
+        shifted = sum(
+            1 for a, b in zip(main_segs, snapped) if a["end"] != b["end"]
+        )
+        print("[beat_sync] snapped {}/{} segment ends to beats".format(
+            shifted, len(main_segs) - 1
+        ))
+        main_segs = snapped
     if main_segs:
         parts = []
         durations = []
@@ -1020,6 +1093,7 @@ def main():
                 sfx_on_title=default_sfx_on_title,
                 zoom_peaks=seg_zoom_peaks,
                 stabilize=bool(seg.get("stabilize", default_stabilize)),
+                quality=default_quality,
             )
             parts.append(part)
             # Effective duration after speed change (matters for xfade offsets).
@@ -1034,6 +1108,7 @@ def main():
             ec_path = tmp_dir / "main_end_card.mp4"
             ec_path, ec_dur = make_end_card_part(
                 end_card_spec, src_dims, default_accent, ec_path,
+                quality=default_quality,
             )
             parts.append(ec_path)
             durations.append(ec_dur)
@@ -1041,7 +1116,8 @@ def main():
 
         main_out = out_dir / "main.mp4"
         assemble_main(parts, main_out, durations,
-                      music_path=music_path, transitions=transitions)
+                      music_path=music_path, transitions=transitions,
+                      quality=default_quality)
         print("main → {}".format(main_out))
 
         # Optional alternate-aspect exports of the main compilation.
@@ -1054,7 +1130,9 @@ def main():
             else:
                 print("[export] skipping unknown format: " + fmt)
                 continue
-            export_format(main_out, fmt, fmt_out, vertical_fit=default_vertical_fit)
+            export_format(main_out, fmt, fmt_out,
+                          vertical_fit=default_vertical_fit,
+                          quality=default_quality)
             print("main → {}".format(fmt_out))
 
     # ---- clips ----
@@ -1112,6 +1190,7 @@ def main():
             zoom_peaks=clip_zoom_peaks,
             stabilize=bool(clip.get("stabilize", default_stabilize)),
             face_track=face_track,
+            quality=default_quality,
         )
         print("clip → {}".format(clips_dir / name))
 
@@ -1149,6 +1228,7 @@ def main():
                 zoom_peaks=clip_zoom_peaks,
                 stabilize=bool(clip.get("stabilize", default_stabilize)),
                 face_track=face_track,
+                quality=default_quality,
             )
             print("clip → {}".format(vert_dir / name))
 
