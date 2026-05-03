@@ -390,6 +390,7 @@ def render_clip(
     lut_path=None,
     speed=1.0,
     audio_clean=False,
+    sfx_on_title=False,
 ):
     """Render one polished clip. Returns the output path."""
     dur = end - start
@@ -552,8 +553,29 @@ def render_clip(
     )
     if not is_main_part:
         a_filter_parts.append(LOUDNORM_CLIP)
-    a_filter = ",".join(a_filter_parts)
-    full_chain += ";[0:a]{}[a]".format(a_filter)
+    a_voice_chain = ",".join(a_filter_parts)
+
+    # Optional whoosh SFX synced to the title-in. We synthesize a quick
+    # tone via lavfi as an *appended* input (so the existing PNG indices
+    # stay stable), then mix it into the voice audio at t=0.
+    if sfx_on_title and title:
+        sfx_idx = next_input_idx
+        # 0.35s sine "thump" — short and unobtrusive; landed sounds rather
+        # than sustained tones work better as title accents.
+        inputs += [
+            "-f", "lavfi",
+            "-t", "0.4",
+            "-i", "sine=frequency=200:duration=0.4:sample_rate=44100",
+        ]
+        next_input_idx += 1
+        full_chain += (
+            ";[0:a]{voice}[v_aud];"
+            "[{sfx}:a]volume=0.45,"
+            "afade=t=in:st=0:d=0.02,afade=t=out:st=0.22:d=0.18[sfx];"
+            "[v_aud][sfx]amix=inputs=2:duration=first:weights=1.0 1.0[a]"
+        ).format(voice=a_voice_chain, sfx=sfx_idx)
+    else:
+        full_chain += ";[0:a]{}[a]".format(a_voice_chain)
 
     cmd = [
         "ffmpeg", "-y",
@@ -707,6 +729,7 @@ def main():
     default_main_transition = style_get("main_transition")
     default_accent = style.get("accent", "#FFD24A")
     drop_fillers = bool(style.get("drop_fillers", False))
+    default_sfx_on_title = bool(style.get("sfx_on_title", False))
 
     if default_vertical_fit not in VERT_FITS:
         sys.exit("unknown vertical_fit: {!r} (valid: {})".format(
@@ -806,6 +829,7 @@ def main():
                 lut_path=lut_path,
                 speed=seg_speed,
                 audio_clean=default_audio_clean,
+                sfx_on_title=default_sfx_on_title,
             )
             parts.append(part)
             # Effective duration after speed change (matters for xfade offsets).
@@ -854,6 +878,7 @@ def main():
 
         clip_speed = float(clip.get("speed", 1.0))
         clip_audio_clean = bool(clip.get("audio_clean", default_audio_clean))
+        clip_sfx = bool(clip.get("sfx_on_title", default_sfx_on_title))
 
         # landscape version
         assets_l = tmp_dir / "clip_{:02d}_l".format(i)
@@ -875,6 +900,7 @@ def main():
             lut_path=lut_path,
             speed=clip_speed,
             audio_clean=clip_audio_clean,
+            sfx_on_title=clip_sfx,
         )
         print("clip → {}".format(clips_dir / name))
 
@@ -908,6 +934,7 @@ def main():
                 lut_path=lut_path,
                 speed=clip_speed,
                 audio_clean=clip_audio_clean,
+                sfx_on_title=clip_sfx,
             )
             print("clip → {}".format(vert_dir / name))
 

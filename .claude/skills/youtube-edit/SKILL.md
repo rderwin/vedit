@@ -125,31 +125,63 @@ Outputs in `<workdir>/out/`: `main.mp4`, `clips/NN_slug.mp4`, `clips_vertical/NN
 ```json
 "style": {
   "preset": "tiktok",
+  "look": "cinematic",
   "vertical_fit": "fill_height",
   "caption_style": "pop",
+  "caption_mode": "word",
   "title_anim": "slide",
+  "main_transition": "fadeblack",
   "accent": "#FFD24A",
-  "use_music": true
+  "use_music": true,
+  "audio_clean": true,
+  "sfx_on_title": true,
+  "drop_fillers": true,
+  "lut": "presets/teal_orange.cube",
+  "logo_position": "top_right",
+  "logo_opacity": 0.85,
+  "logo_scale": 0.10,
+  "end_card": {
+    "title": "Show name",
+    "subtitle": "Episode title",
+    "cta": "Subscribe for more",
+    "duration": 4.0
+  }
 }
 ```
 
-| Preset | vertical_fit | caption_style | title_anim | use_music |
-|---|---|---|---|---|
-| `default`  | blur_fill   | minimal | fade  | true |
-| `tiktok`   | blur_fill   | pop     | slide | true |
-| `gameplay` | fill_height | pop     | slide | true |
-| `podcast`  | blur_fill   | bold    | fade  | true |
+| Preset | vertical_fit | caption_style | caption_mode | title_anim | look | transition | music |
+|---|---|---|---|---|---|---|---|
+| `default`     | blur_fill   | minimal | phrase | fade  | default   | fade      | on |
+| `tiktok`      | blur_fill   | pop     | word   | slide | vibrant   | fade      | on |
+| `gameplay`    | fill_height | pop     | word   | slide | vibrant   | slideleft | on |
+| `podcast`     | blur_fill   | bold    | phrase | fade  | warm      | fade      | on |
+| `cinematic`   | blur_fill   | minimal | phrase | fade  | cinematic | fadeblack | on |
+| `documentary` | blur_fill   | bold    | phrase | fade  | bw        | fadeblack | on |
+
+**Style key reference:**
 
 - `vertical_fit` — `blur_fill` (talking-head video; subject doesn't get cropped) or `fill_height` (screen-recorded content; the center column fills the 9:16 frame).
 - `caption_style` — `minimal` (white text + thick black stroke), `bold` (white text on dark rounded pill), `pop` (black text on accent-colored pill, MrBeast-adjacent).
+- `caption_mode` — `phrase` (≤4-word chunks) or `word` (one word per chunk, TikTok-2024 style; falls back to phrase if more than 80 words in a clip).
 - `title_anim` — `fade` (alpha-only) or `slide` (slide in from the left + fade).
-- `accent` — hex color used by title stripes and `pop` caption pills.
-- `use_music` — when true and a `music.mp3` (or `.m4a`/`.wav`/`.ogg`) is present in the workdir, the main compilation gets a sidechain-ducked music bed. See [`MUSIC.md`](MUSIC.md) for legal sources.
+- `look` — color-grade preset. Choices: `default`, `cinematic`, `warm`, `cool`, `bw`, `vibrant`, `punchy`. Layered ON TOP of an optional 3D LUT.
+- `lut` — path (relative to workdir or absolute) to a `.cube` 3D LUT applied before the local color grade. Free LUTs at lutify.me/free-luts and freshluts.com.
+- `main_transition` — default xfade type between main segments. Any of the 35+ supported types: `fade`, `fadeblack`, `fadewhite`, `dissolve`, `pixelize`, `wipeleft`/`right`/`up`/`down`, `slideleft`/`right`/`up`/`down`, `circleopen`/`close`, `radial`, `squeezeh`/`v`, `zoomin`, etc.
+- `accent` — hex color used by title stripes, `pop` caption pills, end-card stripe & CTA, thumbnails.
+- `use_music` — drop a `music.mp3`/`.m4a`/`.wav`/`.ogg` in the workdir; the main compilation gets a sidechain-ducked music bed. See [`MUSIC.md`](MUSIC.md) for legal sources.
+- `audio_clean` — runs `afftdn` (FFT-based denoise) before loudnorm. Default on for podcast/documentary/cinematic presets.
+- `sfx_on_title` — synthesized whoosh accent at the start of each title-in. Default off.
+- `drop_fillers` — strip `um/uh/uhh/uhm/er` from captions before they're rendered.
+- `logo_position` — `top_right` / `top_left` / `bottom_right` / `bottom_left`. A `logo.png` (or `.jpg`) in the workdir is auto-detected and overlaid at the corner.
+- `logo_opacity` (0..1), `logo_scale` (fraction of width).
+- `end_card` — branded card appended to the main compilation. Object with `title`, `subtitle`, `cta`, `duration` (seconds), `transition` (xfade type into the card; default `fadeblack`).
 
-**Per-clip overrides** (any of the style keys can be set on a single clip):
+**Per-segment / per-clip overrides** (any of the style keys can be set on a single clip or main-segment):
 
-- `vertical_fit`, `caption_style`, `title_anim`, `accent`
-- `captions`: `true`/`false`. Default on for vertical, off for landscape.
+- `vertical_fit`, `caption_style`, `caption_mode`, `title_anim`, `look`, `accent`, `audio_clean`, `sfx_on_title`
+- `transition` (per main segment) — xfade INTO this segment.
+- `speed` (per segment or clip) — `0.5` for slow-mo, `2.0` for fast-fwd. Caption timestamps and PNG durations adjust automatically.
+- `captions: true|false` per clip. Default on for vertical, off for landscape.
 
 ---
 
@@ -300,22 +332,42 @@ Use `loud_peaks` to anchor the highlights list. Use the transcript to lift the b
 
 ## Mode: `supercut`
 
-Combine the same kind of moment from multiple YouTube URLs into one compilation. Useful for "every time X says Y" or "channel best-of".
+Combine moments from multiple YouTube videos into one compilation. Useful for "every time X says Y", channel best-of, or theme-based supercuts ("best wipeouts of the year").
 
-1. Run the shared workflow (download → transcribe → analyze) once for each URL into separate `<workdir>` directories.
-2. Pick moments from each (you'll likely build per-video EDLs, then merge).
-3. Hand-build a `multi_edl.json` listing each clip's source workdir + start/end:
+1. Run the shared workflow (download → transcribe → analyze) once per URL into separate `<workdir>` directories under `vedit-runs/`.
+2. Pick moments from each video by reading their transcripts and signals.
+3. Create a new output workdir (e.g. `vedit-runs/supercut-1/`) and write `multi_edl.json` referencing the source workdirs:
 
    ```json
    {
+     "style": {"preset": "tiktok"},
+     "target_dims": [1280, 720],
+     "main": {
+       "title": "Best of the channel",
+       "segments": [
+         {"workdir": "../abc", "start": 412.0, "end": 433.5, "label": "From stream A"},
+         {"workdir": "../xyz", "start":  12.0, "end":  35.0,
+          "label": "From stream B", "transition": "wipeleft"}
+       ]
+     },
      "clips": [
-       {"workdir": "vedit-runs/abc",  "start": 412.0, "end": 433.5, "title": "..."},
-       {"workdir": "vedit-runs/xyz",  "start": 12.0,  "end": 35.0,  "title": "..."}
+       {"workdir": "../abc", "slug": "best_a", "title": "...",
+        "start": 412.0, "end": 425.0, "vertical": true}
      ]
    }
    ```
 
-4. *(TODO: scripts/supercut.py — runs each cut through the polish pipeline against the right source, then xfades them together. Until that lands, fall back to per-video `assemble.py` runs followed by manual ffmpeg concat.)*
+   `workdir` paths resolve relative to the directory of `multi_edl.json` itself, so `../abc` works.
+
+4. Run:
+
+   ```bash
+   uv run --quiet .claude/skills/youtube-edit/scripts/supercut.py vedit-runs/supercut-1
+   ```
+
+5. Output lands in `vedit-runs/supercut-1/out/main.mp4`, `out/clips/`, `out/clips_vertical/` — all parts normalized to `target_dims` so cross-source dimensions don't fight.
+
+Music + logo are looked up in the **output** workdir, not the source workdirs — drop one `music.mp3` and one `logo.png` for the supercut as a whole.
 
 ---
 
@@ -345,16 +397,35 @@ A reasonable default workflow when the user is non-specific: produce `highlights
 
 ## Status / TODO
 
-- ✅ `highlights`, `shorts`, `quotecards`, `thumbnails`, `chapters`, `summary`
-- ✅ Style presets (`default`, `tiktok`, `gameplay`, `podcast`)
-- ✅ Caption styles (`minimal`, `bold`, `pop`)
+See [`ROADMAP.md`](ROADMAP.md) for the full landscape of features and the open-source dependencies that would do the heavy lifting for each.
+
+**Shipped:**
+
+- ✅ Modes: `highlights`, `shorts`, `quotecards`, `thumbnails`, `chapters`, `summary`, `supercut`
+- ✅ Six style presets (`default`, `tiktok`, `gameplay`, `podcast`, `cinematic`, `documentary`)
+- ✅ Three caption styles (`minimal`, `bold`, `pop`)
+- ✅ Two caption modes (`phrase`, `word`)
 - ✅ Animated title slide-in
+- ✅ Seven color-grade looks (`default`, `cinematic`, `warm`, `cool`, `bw`, `vibrant`, `punchy`)
+- ✅ 3D LUT (`.cube`) support via `style.lut`
+- ✅ 35+ xfade transitions per main segment
+- ✅ Logo overlay (auto-detected from `logo.png`)
+- ✅ End-screen card with title / subtitle / CTA
 - ✅ Music bed with sidechain auto-ducking ([`MUSIC.md`](MUSIC.md))
-- ⏳ `supercut` — multi-URL combinator script
-- ⏳ Word-level captions — single-word pop-in with active highlight (TikTok 2024 style). Requires `whisper-cli -ml 1` for word-level VTT.
-- ⏳ Auto-zoom on reaction peaks — small kenburns ramp during top loudness peaks.
-- ⏳ More transition styles — currently fade-only between main segments; `xfade` supports many (wipeleft, slideup, dissolve, pixelize, circleopen, …).
-- ⏳ Color-grade presets (cinematic teal-orange, warm vintage, B&W, etc.).
-- ⏳ Sound FX library (whoosh on title-in, pop on caption, ding on punchline).
-- ⏳ Brand kit (logo overlay, end-screen card with subscribe prompt).
-- ⏳ Auto-upload to YouTube / TikTok / Shorts.
+- ✅ Speed ramps (`speed: 0.5` slow-mo / `2.0` fast-fwd)
+- ✅ Audio cleanup (`afftdn` denoise) before loudnorm
+- ✅ Synthesized SFX whoosh on title-in
+- ✅ Filler-word stripping (`drop_fillers`)
+- ✅ Auto-EDL generator from signals (`auto_edl.py`)
+- ✅ Multi-URL supercut script
+
+**On the way (see ROADMAP.md):**
+
+- ⏳ Word-level captions with active-word highlight (needs `whisper-cli -ml 1` or WhisperX)
+- ⏳ Smart vertical crop following the speaker (mediapipe face detection)
+- ⏳ Auto-zoom on reaction peaks (kenburns ramp during top loudness peaks)
+- ⏳ Stabilization (vidstab two-pass)
+- ⏳ Beat-synced cuts (librosa)
+- ⏳ Speaker diarization labels (pyannote / WhisperX)
+- ⏳ Multi-format export (square + vertical + landscape from one EDL)
+- ⏳ Auto-upload to YouTube / TikTok / Shorts
