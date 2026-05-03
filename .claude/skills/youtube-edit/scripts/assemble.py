@@ -62,6 +62,36 @@ COLOR_GRADE = "eq=contrast=1.05:saturation=1.10:gamma=1.02,unsharp=5:5:0.6:5:5:0
 LOUDNORM_CLIP = "loudnorm=I=-14:TP=-1.5:LRA=11"
 LOUDNORM_MAIN = "loudnorm=I=-16:TP=-1.5:LRA=11"
 
+# Style presets bundle a coherent look. Per-key options in style{} override.
+PRESETS = {
+    "default": {
+        "vertical_fit": "blur_fill",
+        "caption_style": "minimal",
+        "title_anim": "fade",
+        "use_music": True,   # only kicks in if a music file is present
+    },
+    "tiktok": {
+        "vertical_fit": "blur_fill",
+        "caption_style": "pop",
+        "title_anim": "slide",
+        "use_music": True,
+    },
+    "gameplay": {
+        "vertical_fit": "fill_height",
+        "caption_style": "pop",
+        "title_anim": "slide",
+        "use_music": True,
+    },
+    "podcast": {
+        "vertical_fit": "blur_fill",
+        "caption_style": "bold",
+        "title_anim": "fade",
+        "use_music": True,
+    },
+}
+
+MUSIC_NAMES = ("music.mp3", "music.m4a", "music.wav", "music.ogg")
+
 VERT_BLUR_FILL = (
     "split=2[bgsrc][fgsrc];"
     "[bgsrc]scale={W}:{H}:force_original_aspect_ratio=increase,"
@@ -158,6 +188,9 @@ def render_clip(
     work_assets=None,
     is_main_part=False,
     vertical_fit="blur_fill",
+    caption_style="minimal",
+    title_anim="fade",
+    accent="#FFD24A",
 ):
     """Render one polished clip. Returns the output path."""
     dur = end - start
@@ -192,7 +225,8 @@ def render_clip(
     if captions:
         for i, c in enumerate(captions):
             cap_png = work_assets / "cap_{}.png".format(i)
-            img = render_caption(c["text"], out_w, out_h)
+            img = render_caption(c["text"], out_w, out_h,
+                                 style=caption_style, accent=accent)
             img.save(cap_png)
             inputs += png_input_prefix + ["-i", str(cap_png)]
             prev_label = overlays[-1]
@@ -210,25 +244,38 @@ def render_clip(
             )
             next_input_idx += 1
 
-    # Title overlay with alpha fade in/out.
+    # Title overlay. Always uses an alpha fade; `title_anim="slide"` adds a
+    # slide-in from the left + slide-out to the left, combined with the fade.
     if title:
         title_png = work_assets / "title.png"
-        img = render_title_card(title, out_w, out_h)
+        img = render_title_card(title, out_w, out_h, accent=accent)
         img.save(title_png)
         inputs += png_input_prefix + ["-i", str(title_png)]
         prev_label = overlays[-1]
+        out_st = TITLE_FADE + TITLE_HOLD
+        if title_anim == "slide":
+            # x ramps -w → 0 over [0, TITLE_FADE], holds at 0 during HOLD,
+            # then 0 → -w over [out_st, out_st+TITLE_FADE].
+            x_expr = (
+                "if(lt(t\\,{f}),-w*({f}-t)/{f},"
+                "if(gt(t\\,{out_st}),-w*(t-{out_st})/{f},0))"
+            ).format(f=TITLE_FADE, out_st=out_st)
+            overlay_x = "x='{}'".format(x_expr)
+        else:
+            overlay_x = "x=0"
         full_chain += (
             ";[{idx}:v]format=rgba,"
             "fade=t=in:st=0:d={f}:alpha=1,"
             "fade=t=out:st={out_st}:d={f}:alpha=1[ttl];"
-            "{prev}[ttl]overlay=0:0:format=auto:"
+            "{prev}[ttl]overlay={ox}:y=0:format=auto:"
             "enable='between(t,0,{total})'[v]"
         ).format(
             idx=next_input_idx,
             f=TITLE_FADE,
-            out_st=TITLE_FADE + TITLE_HOLD,
+            out_st=out_st,
             total=TITLE_TOTAL,
             prev=prev_label,
+            ox=overlay_x,
         )
         next_input_idx += 1
     else:
@@ -263,10 +310,25 @@ def render_clip(
     return out
 
 
-def assemble_main(parts, out, durations, xfade=0.5):
-    """Concatenate `parts` (mp4 paths) with xfade + acrossfade transitions."""
-    if len(parts) == 1:
-        # one part — just transcode it through loudnorm
+def assemble_main(parts, out, durations, xfade=0.5, music_path=None):
+    """Concatenate `parts` (mp4 paths) with xfade + acrossfade transitions.
+
+    If `music_path` is given, the music is looped, ducked under the voice
+    via `sidechaincompress`, and mixed in. Final loudnorm pass either way.
+    """
+    inputs = []
+    for p in parts:
+        inputs += ["-i", str(p)]
+
+    music_idx = None
+    if music_path is not None:
+        music_idx = len(parts)
+        # -stream_loop -1 makes ffmpeg loop the input file indefinitely so
+        # the bed covers the whole compilation regardless of music length.
+        inputs += ["-stream_loop", "-1", "-i", str(music_path)]
+
+    if len(parts) == 1 and music_idx is None:
+        # Fast path — single part, no music — keep video stream copy.
         run([
             "ffmpeg", "-y", "-i", str(parts[0]),
             "-c:v", "copy",
@@ -276,10 +338,6 @@ def assemble_main(parts, out, durations, xfade=0.5):
             str(out),
         ])
         return
-
-    inputs = []
-    for p in parts:
-        inputs += ["-i", str(p)]
 
     # Build xfade chain. After each xfade, total length = sum(durs) - xfade*(i)
     v_label = "[0:v]"
@@ -304,9 +362,29 @@ def assemble_main(parts, out, durations, xfade=0.5):
         a_label = new_a
         cumulative += durations[i] - xfade
 
-    # Loudnorm has to live inside the filter graph since the audio stream
-    # was produced by acrossfade (you can't mix -filter_complex with -af).
-    chain_parts.append("{prev}{ln}[aout]".format(prev=a_label, ln=LOUDNORM_MAIN))
+    if music_idx is not None:
+        # Split the voice into two streams: one for the mix, one as the
+        # sidechain trigger that ducks the music. Mix voice + ducked music,
+        # then loudnorm the result.
+        chain_parts.append(
+            "{prev}asplit=2[voice_a][voice_sc]".format(prev=a_label)
+        )
+        chain_parts.append(
+            "[{m}:a]aformat=channel_layouts=stereo,volume=0.40[music_in]".format(
+                m=music_idx
+            )
+        )
+        chain_parts.append(
+            "[music_in][voice_sc]sidechaincompress="
+            "threshold=0.03:ratio=10:attack=5:release=400:level_sc=4[music_duck]"
+        )
+        chain_parts.append(
+            "[voice_a][music_duck]amix=inputs=2:duration=first:"
+            "weights=1.0 0.65,{ln}[aout]".format(ln=LOUDNORM_MAIN)
+        )
+    else:
+        # No music — just loudnorm the voice stream directly.
+        chain_parts.append("{prev}{ln}[aout]".format(prev=a_label, ln=LOUDNORM_MAIN))
     a_label = "[aout]"
 
     filter_complex = ";".join(chain_parts)
@@ -339,15 +417,50 @@ def main():
     if tpath.exists():
         transcript = json.loads(tpath.read_text())
 
-    # Top-level style (applies to all vertical clips unless overridden per-clip).
+    # Top-level style. A `preset` fills in defaults; explicit keys override.
     style = edl.get("style") or {}
-    default_vertical_fit = style.get("vertical_fit", "blur_fill")
+    preset_name = style.get("preset", "default")
+    if preset_name not in PRESETS:
+        sys.exit(
+            "unknown preset: {!r} (valid: {})".format(
+                preset_name, ", ".join(sorted(PRESETS))
+            )
+        )
+    preset = PRESETS[preset_name]
+
+    def style_get(key):
+        return style.get(key, preset[key])
+
+    default_vertical_fit = style_get("vertical_fit")
+    default_caption_style = style_get("caption_style")
+    default_title_anim = style_get("title_anim")
+    default_use_music = style_get("use_music")
+    default_accent = style.get("accent", "#FFD24A")
+
     if default_vertical_fit not in VERT_FITS:
         sys.exit(
             "unknown vertical_fit: {!r} (valid: {})".format(
                 default_vertical_fit, ", ".join(sorted(VERT_FITS))
             )
         )
+
+    # Music detection: look for music.<ext> in the workdir.
+    music_path = None
+    if default_use_music:
+        for name in MUSIC_NAMES:
+            p = workdir / name
+            if p.exists():
+                music_path = p
+                break
+    print(
+        "[style] preset={} vfit={} caps={} title={} music={}".format(
+            preset_name,
+            default_vertical_fit,
+            default_caption_style,
+            default_title_anim,
+            music_path.name if music_path else "off",
+        )
+    )
 
     out_dir = workdir / "out"
     out_dir.mkdir(exist_ok=True)
@@ -377,11 +490,13 @@ def main():
                 src_dims=src_dims,
                 work_assets=assets,
                 is_main_part=True,
+                title_anim=default_title_anim,
+                accent=default_accent,
             )
             parts.append(part)
             durations.append(float(seg["end"]) - float(seg["start"]))
         main_out = out_dir / "main.mp4"
-        assemble_main(parts, main_out, durations)
+        assemble_main(parts, main_out, durations, music_path=music_path)
         print("main → {}".format(main_out))
 
     # ---- clips ----
@@ -400,6 +515,10 @@ def main():
         caps_default = do_vertical
         do_caps = clip.get("captions", caps_default) and transcript
 
+        cap_style = clip.get("caption_style", default_caption_style)
+        t_anim = clip.get("title_anim", default_title_anim)
+        accent = clip.get("accent", default_accent)
+
         # landscape version
         assets_l = tmp_dir / "clip_{:02d}_l".format(i)
         assets_l.mkdir(exist_ok=True)
@@ -410,6 +529,8 @@ def main():
             captions=None,  # don't burn captions on landscape by default
             src_dims=src_dims,
             work_assets=assets_l,
+            title_anim=t_anim,
+            accent=accent,
         )
         print("clip → {}".format(clips_dir / name))
 
@@ -427,6 +548,9 @@ def main():
                 src_dims=src_dims,
                 work_assets=assets_v,
                 vertical_fit=v_fit,
+                caption_style=cap_style,
+                title_anim=t_anim,
+                accent=accent,
             )
             print("clip → {}".format(vert_dir / name))
 

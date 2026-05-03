@@ -104,8 +104,14 @@ def render_title_card(text, width, height, accent="#FFD24A"):
     return img
 
 
-def render_caption(text, width, height):
-    """Centered, big, bold short-form caption (TikTok / Reels style)."""
+def render_caption(text, width, height, style="minimal", accent="#FFD24A"):
+    """Centered, big, bold short-form caption (TikTok / Reels style).
+
+    Styles:
+      minimal — white text + thick black stroke (current default).
+      bold    — white text on a black rounded pill (no stroke).
+      pop     — black text on an accent-colored pill (MrBeast-adjacent).
+    """
     img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     is_vertical = height > width
@@ -124,17 +130,47 @@ def render_caption(text, width, height):
     block_h = line_h * len(lines)
     y0 = int(height * center_y_frac) - block_h // 2
 
-    stroke_w = max(4, int(font_size * 0.085))
+    if style == "minimal":
+        stroke_w = max(4, int(font_size * 0.085))
+        for i, line in enumerate(lines):
+            line_w = draw.textlength(line, font=font)
+            x = (width - line_w) // 2
+            y = y0 + i * line_h
+            draw.text(
+                (x, y),
+                line,
+                fill=(255, 255, 255, 255),
+                font=font,
+                stroke_width=stroke_w,
+                stroke_fill=(0, 0, 0, 255),
+            )
+        return img
+
+    # `bold` and `pop` use a colored rounded pill behind each line.
+    if style == "pop":
+        bg = _hex_rgba(accent)[:3] + (235,)
+        fg = (16, 16, 18, 255)
+    else:  # bold
+        bg = (16, 16, 18, 220)
+        fg = (255, 255, 255, 255)
+
+    pad_x = int(font_size * 0.45)
+    pad_y = int(font_size * 0.12)
+    radius = int(font_size * 0.30)
+
     for i, line in enumerate(lines):
         line_w = draw.textlength(line, font=font)
-        x = (width - line_w) // 2
-        y = y0 + i * line_h
-        draw.text(
-            (x, y),
-            line,
-            fill=(255, 255, 255, 255),
-            font=font,
-            stroke_width=stroke_w,
-            stroke_fill=(0, 0, 0, 255),
-        )
+        text_x = (width - line_w) // 2
+        text_y = y0 + i * line_h
+        # Pill rect bounds
+        x1 = text_x - pad_x
+        y1 = text_y - pad_y
+        x2 = text_x + line_w + pad_x
+        y2 = text_y + font_size + pad_y
+        try:
+            draw.rounded_rectangle((x1, y1, x2, y2), radius=radius, fill=bg)
+        except Exception:
+            draw.rectangle((x1, y1, x2, y2), fill=bg)
+        draw.text((text_x, text_y), line, fill=fg, font=font)
+
     return img

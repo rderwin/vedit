@@ -120,13 +120,35 @@ Outputs in `<workdir>/out/`: `main.mp4`, `clips/NN_slug.mp4`, `clips_vertical/NN
 - *Clips:* each must be self-contained. ~15–30s sweet spot. Hook in the first 2 seconds. Leave ~0.5–1s of breath at the end. Don't cut on the laugh — let it land.
 - Pad starts ~0.5–1s before the first word (caption timestamps lag the audio).
 
-**Style options (top-level `style` block):**
+**Top-level `style` block** — bundles a coherent look. Set a `preset` and override individual keys as needed:
 
-- `vertical_fit`: `"blur_fill"` (default; scales to fit width with blurred-fill background — best for talking-head video) or `"fill_height"` (scales to fill the 9:16 height and crops sides — best for screen-recorded streams, gameplay, chess.com, etc., where the action lives in the center column).
+```json
+"style": {
+  "preset": "tiktok",
+  "vertical_fit": "fill_height",
+  "caption_style": "pop",
+  "title_anim": "slide",
+  "accent": "#FFD24A",
+  "use_music": true
+}
+```
 
-**Per-clip overrides:**
+| Preset | vertical_fit | caption_style | title_anim | use_music |
+|---|---|---|---|---|
+| `default`  | blur_fill   | minimal | fade  | true |
+| `tiktok`   | blur_fill   | pop     | slide | true |
+| `gameplay` | fill_height | pop     | slide | true |
+| `podcast`  | blur_fill   | bold    | fade  | true |
 
-- `vertical_fit`: same options as the global style, set per-clip.
+- `vertical_fit` — `blur_fill` (talking-head video; subject doesn't get cropped) or `fill_height` (screen-recorded content; the center column fills the 9:16 frame).
+- `caption_style` — `minimal` (white text + thick black stroke), `bold` (white text on dark rounded pill), `pop` (black text on accent-colored pill, MrBeast-adjacent).
+- `title_anim` — `fade` (alpha-only) or `slide` (slide in from the left + fade).
+- `accent` — hex color used by title stripes and `pop` caption pills.
+- `use_music` — when true and a `music.mp3` (or `.m4a`/`.wav`/`.ogg`) is present in the workdir, the main compilation gets a sidechain-ducked music bed. See [`MUSIC.md`](MUSIC.md) for legal sources.
+
+**Per-clip overrides** (any of the style keys can be set on a single clip):
+
+- `vertical_fit`, `caption_style`, `title_anim`, `accent`
 - `captions`: `true`/`false`. Default on for vertical, off for landscape.
 
 ---
@@ -324,9 +346,15 @@ A reasonable default workflow when the user is non-specific: produce `highlights
 ## Status / TODO
 
 - ✅ `highlights`, `shorts`, `quotecards`, `thumbnails`, `chapters`, `summary`
-- ⏳ `supercut` — multi-URL combinator script (see Mode section above)
+- ✅ Style presets (`default`, `tiktok`, `gameplay`, `podcast`)
+- ✅ Caption styles (`minimal`, `bold`, `pop`)
+- ✅ Animated title slide-in
+- ✅ Music bed with sidechain auto-ducking ([`MUSIC.md`](MUSIC.md))
+- ⏳ `supercut` — multi-URL combinator script
 - ⏳ Word-level captions — single-word pop-in with active highlight (TikTok 2024 style). Requires `whisper-cli -ml 1` for word-level VTT.
-- ⏳ Animated title slide-in — currently fade-only.
 - ⏳ Auto-zoom on reaction peaks — small kenburns ramp during top loudness peaks.
-- ⏳ Music bed with auto-ducking under speech.
+- ⏳ More transition styles — currently fade-only between main segments; `xfade` supports many (wipeleft, slideup, dissolve, pixelize, circleopen, …).
+- ⏳ Color-grade presets (cinematic teal-orange, warm vintage, B&W, etc.).
+- ⏳ Sound FX library (whoosh on title-in, pop on caption, ding on punchline).
+- ⏳ Brand kit (logo overlay, end-screen card with subscribe prompt).
 - ⏳ Auto-upload to YouTube / TikTok / Shorts.
