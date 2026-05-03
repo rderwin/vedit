@@ -62,13 +62,27 @@ COLOR_GRADE = "eq=contrast=1.05:saturation=1.10:gamma=1.02,unsharp=5:5:0.6:5:5:0
 LOUDNORM_CLIP = "loudnorm=I=-14:TP=-1.5:LRA=11"
 LOUDNORM_MAIN = "loudnorm=I=-16:TP=-1.5:LRA=11"
 
-VERT_BG_FILTER = (
+VERT_BLUR_FILL = (
     "split=2[bgsrc][fgsrc];"
     "[bgsrc]scale={W}:{H}:force_original_aspect_ratio=increase,"
     "crop={W}:{H},gblur=sigma=25[bg];"
     "[fgsrc]scale={W}:-2:force_original_aspect_ratio=decrease[fg];"
     "[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1[base]"
 ).format(W=VERT_W, H=VERT_H)
+
+# Scale the source up so it fills the 9:16 height, then center-crop sides.
+# Better for screen-recorded content (game streams, chess.com, etc.) where
+# the action lives in the center column — the content fills the frame
+# instead of sitting tiny inside a blurred background.
+VERT_FILL_HEIGHT = (
+    "scale={W}:{H}:force_original_aspect_ratio=increase,"
+    "crop={W}:{H},setsar=1[base]"
+).format(W=VERT_W, H=VERT_H)
+
+VERT_FITS = {
+    "blur_fill": VERT_BLUR_FILL,
+    "fill_height": VERT_FILL_HEIGHT,
+}
 
 
 def slugify(s, fallback="clip"):
@@ -143,6 +157,7 @@ def render_clip(
     src_dims=None,
     work_assets=None,
     is_main_part=False,
+    vertical_fit="blur_fill",
 ):
     """Render one polished clip. Returns the output path."""
     dur = end - start
@@ -157,7 +172,8 @@ def render_clip(
     # Build the video filter chain on stream [0:v]. Filters within a chain
     # flow with commas; chains are separated with semicolons.
     if vertical:
-        full_chain = "[0:v]" + COLOR_GRADE + "," + VERT_BG_FILTER
+        fit_filter = VERT_FITS.get(vertical_fit, VERT_BLUR_FILL)
+        full_chain = "[0:v]" + COLOR_GRADE + "," + fit_filter
     else:
         full_chain = "[0:v]" + COLOR_GRADE + "[base]"
 
@@ -323,6 +339,16 @@ def main():
     if tpath.exists():
         transcript = json.loads(tpath.read_text())
 
+    # Top-level style (applies to all vertical clips unless overridden per-clip).
+    style = edl.get("style") or {}
+    default_vertical_fit = style.get("vertical_fit", "blur_fill")
+    if default_vertical_fit not in VERT_FITS:
+        sys.exit(
+            "unknown vertical_fit: {!r} (valid: {})".format(
+                default_vertical_fit, ", ".join(sorted(VERT_FITS))
+            )
+        )
+
     out_dir = workdir / "out"
     out_dir.mkdir(exist_ok=True)
     clips_dir = out_dir / "clips"
@@ -392,6 +418,7 @@ def main():
             assets_v = tmp_dir / "clip_{:02d}_v".format(i)
             assets_v.mkdir(exist_ok=True)
             caps = caption_chunks_for(transcript, start, end) if do_caps else None
+            v_fit = clip.get("vertical_fit", default_vertical_fit)
             render_clip(
                 src, start, end, vert_dir / name,
                 vertical=True,
@@ -399,6 +426,7 @@ def main():
                 captions=caps,
                 src_dims=src_dims,
                 work_assets=assets_v,
+                vertical_fit=v_fit,
             )
             print("clip → {}".format(vert_dir / name))
 

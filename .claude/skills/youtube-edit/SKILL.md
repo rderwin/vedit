@@ -1,27 +1,31 @@
 ---
 name: youtube-edit
-description: Download a YouTube video (livestream or VOD) and turn it into a polished highlight compilation plus a set of short shareable clips. Cuts are picked by reading the transcript and audio/visual signals; output has lower-third titles, TikTok-style burned-in captions on vertical clips, color grade, loudness normalization, and crossfades. Use when the user gives a YouTube URL and asks for a highlight reel, supercut, best-of, compilation, shorts, or clips.
+description: Turn a YouTube video (livestream, VOD, podcast, vlog, gameplay) into shareable assets — highlight compilation, vertical shorts with TikTok-style captions, quote cards, thumbnails, YouTube chapter markers, and show-notes summaries. Use when the user gives a YouTube URL and asks for any of: highlight reel, supercut, best-of, compilation, shorts, clips, quote cards, thumbnail ideas, chapter markers, show notes / blog post / summary.
 ---
 
 # youtube-edit
 
-Turn a long YouTube video — including livestreams — into a tight highlight compilation and a set of short clips, polished enough to post.
+Take a long YouTube video and ship multiple polished outputs from one transcript + signal pass:
+
+| Mode | Output | Good for |
+|---|---|---|
+| `highlights`   | 3–7 min compilation `main.mp4` + N short clips | Best-of reels, "watch the whole thing in 5 min" |
+| `shorts`       | 10–30 vertical clips with burned-in captions | Feeding TikTok / Reels / YouTube Shorts |
+| `quotecards`   | Square / vertical PNG quote cards            | Static social posts (X, IG, LinkedIn) |
+| `thumbnails`   | YouTube thumbnail candidates with bold text  | Upload thumbnails, A/B testing |
+| `chapters`     | YouTube chapter-marker block                 | Pasting into the upload description |
+| `summary`      | Markdown writeup with timestamps             | Show notes, blog post, newsletter |
+| `supercut`     | Cuts pulled from multiple URLs               | "Every time X says Y", channel best-of |
+
+The first three steps (download, transcribe, analyze) are shared across every mode — run them once, then mix and match.
 
 ## When to use
 
-The user provides a YouTube URL (`youtube.com/watch?v=...`, `youtu.be/...`, or a live URL) and asks for any of: "highlight reel", "best of", "supercut", "compilation", "shorts", "clips", "edit this down".
+The user provides one or more YouTube URLs and asks for any of the outputs above, or speaks generically: "make this into something", "I just streamed for 2 hours, help", "post-process this".
 
-## Inputs
+## Shared workflow (run once per video)
 
-- **url** (required) — YouTube video / livestream URL.
-- **workdir** (optional) — defaults to `vedit-runs/<slug>/`.
-- **target_main_minutes** (optional, default 5) — desired length of the main compilation.
-- **num_clips** (optional, default 6) — how many short clips to produce.
-- **vertical** (optional, default true) — also produce 9:16 versions of each clip.
-
-## Workflow
-
-Run from the project root. Scripts are in `.claude/skills/youtube-edit/scripts/`.
+All modes operate on a `<workdir>`, default `vedit-runs/<videoId>/`.
 
 ### 1. Download
 
@@ -29,167 +33,300 @@ Run from the project root. Scripts are in `.claude/skills/youtube-edit/scripts/`
 bash .claude/skills/youtube-edit/scripts/download.sh <URL> <workdir>
 ```
 
-Produces `<workdir>/source.mp4`, `<workdir>/source.en.vtt`, `<workdir>/source.info.json`.
+Produces `source.mp4`, `source.info.json`, and (when YouTube has them) `source.en.vtt`.
 
-For a still-live stream, edit the script to add `--live-from-start` or wait for it to end. Past livestreams (VODs) work as-is.
+For still-live streams, edit the script to add `--live-from-start`, or wait for the broadcast to end.
 
 ### 2. Get a transcript
 
-If the download produced `source.en.vtt` (or `source.en-*.vtt`), parse it:
+If `source.en.vtt` was downloaded, just parse it:
 
 ```bash
 python3 .claude/skills/youtube-edit/scripts/parse_transcript.py <workdir>
 ```
 
-If no VTT was downloaded — common for fresh livestream uploads where YouTube hasn't generated auto-captions yet — fall back to whisper.cpp:
+If no VTT is available (fresh livestream uploads, podcasts, anything without YouTube auto-captions), use whisper.cpp:
 
 ```bash
 bash .claude/skills/youtube-edit/scripts/transcribe.sh <workdir>
 python3 .claude/skills/youtube-edit/scripts/parse_transcript.py <workdir>
 ```
 
-Both paths produce `<workdir>/transcript.json` — `[{start, text}, ...]`. The whisper path takes ~1/10× to ~1/3× real-time on Apple Silicon with the `base.en` model (a 100-min stream → 5–15 min).
+Both produce `<workdir>/transcript.json` — a list of `{start, text}` deduped from rolling captions.
 
-### 3. Analyze signals
+### 3. Extract editing signals
 
 ```bash
 python3 .claude/skills/youtube-edit/scripts/analyze.py <workdir>
 ```
 
-Writes `<workdir>/signals.json`:
+Writes `<workdir>/signals.json` with:
 
-- `loudness` — EBU R128 momentary loudness (LUFS) per 1-second window over the whole video
-- `loud_peaks` — top ~30 loudest 1s windows, separated by ≥15s gaps. Reactions, laughter, shouts, and music swells live here.
-- `scenes` — timestamps where the visual changed sharply (camera cut, screen swap). Useful as natural cut boundaries.
-- `wpm` — sliding 10-second words-per-minute. Spikes mean fast/excited speech.
+- `loudness` — EBU R128 momentary loudness per 1-second window
+- `loud_peaks` — top ~30 loudest 1s windows (≥15s gaps), pre-screened for "something happened"
+- `scenes` — visual scene-change timestamps
+- `wpm` — sliding 10s words-per-minute curve
 
-This step is slower than the others — for a 2-hour stream expect a few minutes.
+Use these signals to **find** moments. Don't read the transcript top-to-bottom — triangulate:
 
-### 4. Pick highlights
+1. Start with `loud_peaks`. Each is a candidate moment.
+2. For each peak, read the transcript ±20s to confirm what's actually there.
+3. Cross-check `wpm` spikes — high words/min often marks the *setup* leading into a peak. Look 5–15s before a loudness peak.
+4. `scenes` are clean cut boundaries when present.
+5. Skim the transcript for content signals the audio doesn't surface — surprising claims, callbacks, named-entity reveals, "wait..." / "no way" / "look at this" beats.
 
-This is the part you (Claude) do. Read all three files:
+You're picking moments here, not committing to outputs yet — the same picks feed multiple modes below.
 
-```
-<workdir>/transcript.json   # what was said and when
-<workdir>/signals.json      # where the energy is and where the cuts are
-<workdir>/source.info.json  # title, duration, uploader
-```
+---
 
-For long videos the transcript will be big — read in chunks if needed.
+## Mode: `highlights`
 
-#### How to find the moments
-
-Don't read the transcript top-to-bottom hoping to spot gold. Triangulate:
-
-1. **Start with `loud_peaks`** — these are pre-screened "something happened here" timestamps.
-2. **For each peak, read the transcript around that time** (±20 seconds). Confirm whether it's a real moment (reaction / punchline / wipeout / reveal) or just background music / a cough.
-3. **Cross-reference with `wpm` spikes** — high words-per-minute usually means excited talking, often the *setup* leading into a peak. Look 5-15s *before* a loudness peak to find the joke setup or the building tension.
-4. **Use `scenes` for cut points** — when a moment sits between two scene changes, prefer cutting at the scene boundaries. Cuts feel more natural and you don't strand half a sentence.
-5. **Skim the transcript directly** for content signals the audio doesn't surface: surprising claims, callbacks, named-entity reveals, escalating arguments, "wait..." / "no way" / "look at this" moments.
-
-#### What makes a good clip
-
-A short clip is good when a stranger scrolling past stops on it. That requires:
-
-- **Self-containedness** — no setup the viewer doesn't have. If understanding the moment requires "earlier in the stream they were arguing about X", either include that setup *in the clip* or pick a different moment.
-- **Hook in the first ~2 seconds** — open on the punchline / reaction / surprising visual, not on three seconds of "...so anyway".
-- **Resolution before the cut** — don't cut on the laugh; let the laugh land. ~0.5-1s of breath at the end.
-- **6-60s long.** Under 6s won't read; over 60s loses retention. Sweet spot 15-30s for shorts.
-
-#### What makes a good main compilation
-
-A compilation is good when it has **shape**:
-
-- **Cold open** — start with the single most arresting moment, often from late in the video. Get the viewer hooked before they know what the show is about.
-- **Build** — alternate setups and payoffs. Vary energy: a quiet beat after a loud one hits harder than two loud beats in a row.
-- **Callbacks** — if a phrase or bit recurs, place those moments back-to-back even if they're far apart in source time.
-- **Strong close** — end on a complete beat (a laugh, a button, a reveal), not on something that begs "what happened next?"
-- **Order is not chronological** — you're cutting for narrative, not for a recap.
-
-#### Timestamp craft
-
-- Pad generously: start ~0.5–1s before the first word (auto-caption timestamps lag the audio), end ~0.5s after the last beat.
-- Don't cut mid-word. Round outward.
-- For reactions and punchlines, leave room for the laugh / silence at the end.
-- When two adjacent transcript entries are clearly the same sentence/breath, treat them as one segment.
-
-#### Output the EDL
+A 3–7 minute compilation plus a handful of short clips.
 
 Write `<workdir>/edl.json`:
 
 ```json
 {
   "source": "source.mp4",
+  "style": {
+    "vertical_fit": "fill_height"
+  },
   "main": {
     "title": "Best of <video title>",
     "segments": [
-      {"start": 234.0, "end": 261.5, "label": "Cold open: the bet"},
+      {"start": 234.0, "end": 261.5, "label": "Cold open"},
       {"start": 12.0,  "end": 48.0,  "label": "How it started"},
       {"start": 305.0, "end": 348.0, "label": "The turn"}
     ]
   },
   "clips": [
-    {
-      "slug": "wipeout",
-      "title": "Massive wipeout at minute 7",
-      "start": 412.0,
-      "end": 433.5,
-      "vertical": true
-    }
+    {"slug": "wipeout", "title": "Massive wipeout",
+     "start": 412.0, "end": 433.5, "vertical": true}
   ]
 }
 ```
 
-Field reference:
-
-- `main.segments[].label` — shows as a lower-third title card for the first ~3s of that segment. Keep it short (≤6 words).
-- `clips[].title` — same, on the clip. Skip the field for no title card.
-- `clips[].vertical` — also produce a 1080×1920 version with blurred-fill background.
-- `clips[].captions` — burn captions on this clip. Defaults to **on** for vertical, **off** for landscape. Set `false` to disable, `true` to force on.
-
-### 5. Assemble
+Run:
 
 ```bash
 uv run --quiet .claude/skills/youtube-edit/scripts/assemble.py <workdir>
 ```
 
-(`uv run` brings in Pillow for the title/caption rendering. The script's PEP 723 metadata declares the dep — no venv to manage.)
+Outputs in `<workdir>/out/`: `main.mp4`, `clips/NN_slug.mp4`, `clips_vertical/NN_slug.mp4`.
 
-What the assembler does for each cut:
+**Picking craft:**
 
-1. Frame-accurate trim from source.
-2. Mild color grade (`eq` contrast/saturation + light `unsharp`).
-3. Vertical clips: blurred-fill 9:16 background with the 16:9 source centered on top.
-4. Title card overlay with 0.4s fade-in, ~2.2s hold, 0.4s fade-out.
-5. Vertical clips: caption chunks (≤4 words each) burned in TikTok-style — big bold white with thick black stroke.
-6. Audio: short fades at the cut boundaries + EBU R128 loudness normalization to social-media targets.
+- *Main:* narrative shape (cold open → setup → build → turn → close). Open with the punchiest moment, often from late in the video. Order is NOT chronological. End on a strong beat, not on something that begs "what happened next?"
+- *Clips:* each must be self-contained. ~15–30s sweet spot. Hook in the first 2 seconds. Leave ~0.5–1s of breath at the end. Don't cut on the laugh — let it land.
+- Pad starts ~0.5–1s before the first word (caption timestamps lag the audio).
 
-Main compilation segments are joined with 0.5s `xfade` video crossfades and matched `acrossfade` audio crossfades, then a final loudnorm pass.
+**Style options (top-level `style` block):**
 
-Outputs land in `<workdir>/out/`:
+- `vertical_fit`: `"blur_fill"` (default; scales to fit width with blurred-fill background — best for talking-head video) or `"fill_height"` (scales to fill the 9:16 height and crops sides — best for screen-recorded streams, gameplay, chess.com, etc., where the action lives in the center column).
 
-- `main.mp4` — the compilation
-- `clips/NN_slug.mp4` — landscape clips
-- `clips_vertical/NN_slug.mp4` — 9:16 versions
+**Per-clip overrides:**
 
-### 6. Report back
+- `vertical_fit`: same options as the global style, set per-clip.
+- `captions`: `true`/`false`. Default on for vertical, off for landscape.
 
-Tell the user where the files are. Give each clip a one-line pitch ("Clip 03 — the moment everyone realized he wasn't kidding"). Don't dump the EDL at them.
+---
+
+## Mode: `shorts`
+
+Pure short-form output — many vertical clips, no main compilation. Same EDL schema, just don't include a `main` block. Aim for 10–30 clips when the source is long.
+
+For shorts specifically:
+
+- Keep clips 12–30s. Anything longer loses retention.
+- Always set `vertical: true` and prefer `vertical_fit: "fill_height"` for screen recordings.
+- Use a punchy `title` per clip — that's the lower-third headline.
+- Captions are on by default for vertical clips and significantly improve mute-watch retention.
+
+After running `assemble.py`, outputs land in `<workdir>/out/clips_vertical/`.
+
+---
+
+## Mode: `quotecards`
+
+Static PNG quote cards for posting on X / Instagram / LinkedIn / Slack.
+
+Write `<workdir>/quotes.json`:
+
+```json
+{
+  "title": "Billy Markus — Road to 1000 ELO",
+  "uploader": "Billy Markus",
+  "format": "square",
+  "accent": "#FFD24A",
+  "quotes": [
+    {"text": "Just some shit poster who's 426. Who's ass at this game? I'm all right.",
+     "attribution": "Billy Markus"},
+    {"text": "Losses become lessens. My lesson is to be less bad."}
+  ]
+}
+```
+
+Run:
+
+```bash
+uv run --quiet .claude/skills/youtube-edit/scripts/quotecards.py <workdir>
+```
+
+Outputs `<workdir>/out/quotecards/NN_slug.png` — one PNG per quote.
+
+`format`: `square` (1080×1080), `vertical` (1080×1920), or `landscape` (1920×1080). The script auto-shrinks the font when the quote is long.
+
+**Picking quotes:** look for one-liners that survive without context — declarative, surprising, or self-deprecating. Avoid quotes that need a setup paragraph.
+
+---
+
+## Mode: `thumbnails`
+
+YouTube thumbnail candidates: a frame from the source + huge bold caps + optional small subhead + accent stripe + light vignette + color pop.
+
+Write `<workdir>/thumbnails.json`:
+
+```json
+{
+  "source": "source.mp4",
+  "format": "youtube",
+  "accent": "#FFD24A",
+  "thumbnails": [
+    {"t": 412.5, "headline": "I LOST MY QUEEN", "subhead": "live reaction"},
+    {"t": 6435,  "headline": "I GOT BETTER",   "subhead": "from 347 → 524"}
+  ]
+}
+```
+
+Run:
+
+```bash
+uv run --quiet .claude/skills/youtube-edit/scripts/thumbnails.py <workdir>
+```
+
+Outputs `<workdir>/out/thumbnails/NN_slug.jpg`.
+
+`format`: `youtube` (1280×720), `square` (1080×1080), or `vertical` (1080×1920).
+
+**Picking the frame:** prefer moments with strong facial expression, a clear visual subject (a chess board mid-blunder, a graph spiking, a face mid-reaction). The `loud_peaks` list is a great starting point — each peak is a candidate frame. Avoid frames in the middle of a transition (you'll get a half-resolved blur).
+
+---
+
+## Mode: `chapters`
+
+Generate a YouTube-format chapter block to paste into the description.
+
+Write `<workdir>/chapters.json`:
+
+```json
+{
+  "chapters": [
+    {"t": 0,    "title": "Intro"},
+    {"t": 92,   "title": "First game starts"},
+    {"t": 1018, "title": "First win"},
+    {"t": 3238, "title": "Did not even see that"},
+    {"t": 6435, "title": "I got better, yee-haw"}
+  ]
+}
+```
+
+Run:
+
+```bash
+python3 .claude/skills/youtube-edit/scripts/chapters.py <workdir>
+```
+
+Prints the markers and writes `<workdir>/out/chapters.txt`.
+
+YouTube rules: first chapter must be at `0:00`, must be ascending, minimum 3. The script enforces the first; provide ≥3 yourself.
+
+**Picking chapters:** look for content shifts — game starts, topic changes, key beats. Good chapters are one-glance descriptive, not coy. "First win" beats "It happens".
+
+---
+
+## Mode: `summary`
+
+A markdown writeup of the video — show notes / blog post / newsletter copy.
+
+This mode doesn't need a separate script. Read `transcript.json`, `signals.json`, and `source.info.json`, then write `<workdir>/out/summary.md` directly. Suggested structure:
+
+```markdown
+# {video title}
+
+*{uploader} · {duration} · {date} · {URL}*
+
+## TL;DR
+2-3 bullets. What the viewer gets out of watching.
+
+## Highlights
+- **0:09** Cold open — short summary
+- **17:10** First win — short summary
+- ...
+
+## Best lines
+> Quote 1.
+
+> Quote 2.
+
+## Watch on YouTube
+{URL}
+```
+
+Use `loud_peaks` to anchor the highlights list. Use the transcript to lift the best lines verbatim. Keep summaries scannable — bold the timestamps, keep bullets short.
+
+---
+
+## Mode: `supercut`
+
+Combine the same kind of moment from multiple YouTube URLs into one compilation. Useful for "every time X says Y" or "channel best-of".
+
+1. Run the shared workflow (download → transcribe → analyze) once for each URL into separate `<workdir>` directories.
+2. Pick moments from each (you'll likely build per-video EDLs, then merge).
+3. Hand-build a `multi_edl.json` listing each clip's source workdir + start/end:
+
+   ```json
+   {
+     "clips": [
+       {"workdir": "vedit-runs/abc",  "start": 412.0, "end": 433.5, "title": "..."},
+       {"workdir": "vedit-runs/xyz",  "start": 12.0,  "end": 35.0,  "title": "..."}
+     ]
+   }
+   ```
+
+4. *(TODO: scripts/supercut.py — runs each cut through the polish pipeline against the right source, then xfades them together. Until that lands, fall back to per-video `assemble.py` runs followed by manual ffmpeg concat.)*
+
+---
+
+## Combining modes
+
+The shared signals + transcript pass means it's cheap to ship multiple outputs from one source — for example:
+
+- `highlights` for the long-form recap
+- `shorts` for daily TikTok drip
+- `quotecards` for the X thread
+- `thumbnails` for the YouTube upload
+- `chapters` + `summary` for the description / newsletter
+
+A reasonable default workflow when the user is non-specific: produce `highlights` + `shorts` + `chapters` + `summary` on the first pass. Quote cards and thumbnails are typically taste-driven so wait for direction.
 
 ## Requirements
 
-- `yt-dlp` — `uv tool install yt-dlp`. The download script puts `~/.local/bin` on PATH so a uv-installed yt-dlp is found.
-- `ffmpeg` — `brew install ffmpeg`. The polish pipeline uses `eq`, `unsharp`, `xfade`, `acrossfade`, `loudnorm`, `fade`, `overlay`, `gblur` — all in the standard build.
-- `uv` — used by `assemble.py` to provide Pillow on the fly.
-- **For the transcribe fallback only:** `whisper-cpp` (`brew install whisper-cpp`) and a model file at `~/.cache/whisper-cpp/ggml-base.en.bin`. Download with:
+- `yt-dlp` — `uv tool install yt-dlp` (download script puts `~/.local/bin` on PATH).
+- `ffmpeg` — `brew install ffmpeg`. Standard build is sufficient (`eq`, `unsharp`, `xfade`, `acrossfade`, `loudnorm`, `fade`, `overlay`, `gblur`).
+- `uv` — used by the Pillow-driven scripts (`assemble.py`, `quotecards.py`, `thumbnails.py`).
+- **For the transcribe fallback:** `whisper-cpp` (`brew install whisper-cpp`) and a model file:
   ```bash
   mkdir -p ~/.cache/whisper-cpp
   curl -L -o ~/.cache/whisper-cpp/ggml-base.en.bin \
     https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
   ```
 
-## Not yet implemented
+## Status / TODO
 
-- **Auto-upload** to YouTube / TikTok / Shorts. Files land on disk for the user to upload.
-- **Animated transitions on clips.** Clips currently use hard cuts (clean, fast). Could add slide/zoom motion.
-- **Brand intro / outro cards** for the main compilation.
+- ✅ `highlights`, `shorts`, `quotecards`, `thumbnails`, `chapters`, `summary`
+- ⏳ `supercut` — multi-URL combinator script (see Mode section above)
+- ⏳ Word-level captions — single-word pop-in with active highlight (TikTok 2024 style). Requires `whisper-cli -ml 1` for word-level VTT.
+- ⏳ Animated title slide-in — currently fade-only.
+- ⏳ Auto-zoom on reaction peaks — small kenburns ramp during top loudness peaks.
+- ⏳ Music bed with auto-ducking under speech.
+- ⏳ Auto-upload to YouTube / TikTok / Shorts.
