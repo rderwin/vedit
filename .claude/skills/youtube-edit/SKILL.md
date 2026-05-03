@@ -116,15 +116,24 @@ Writes `<workdir>/signals.json` with:
 - `scenes` — visual scene-change timestamps
 - `wpm` — sliding 10s words-per-minute curve
 
-Use these signals to **find** moments. Don't read the transcript top-to-bottom — triangulate:
+### 4. Pick moments (this is YOUR job)
 
-1. Start with `loud_peaks`. Each is a candidate moment.
-2. For each peak, read the transcript ±20s to confirm what's actually there.
-3. Cross-check `wpm` spikes — high words/min often marks the *setup* leading into a peak. Look 5–15s before a loudness peak.
+**Claude is the picker.** When you (Claude) are invoked through this skill, you read `transcript.json` + `signals.json` + `source.info.json` yourself, decide which moments matter, and write the EDL. Everything else in this skill — download, transcribe, fix, analyze, render, multi-format, music ducking, smart vertical, all of it — is mechanics around that one human-meaningful decision. Don't outsource it; nothing else has your judgment about what's actually funny / interesting / quotable.
+
+How to read the data:
+
+1. Open `signals.json`'s `loud_peaks` first. Each is a "something happened here" candidate, pre-screened.
+2. For each peak, read the transcript ±20s to confirm what's there. Most peaks are real moments; some are background music / a sneeze / a click.
+3. Cross-check `wpm` spikes — high words/min often marks the *setup* leading into a peak. Look 5–15s **before** a loudness peak to find the joke setup or building tension.
 4. `scenes` are clean cut boundaries when present.
 5. Skim the transcript for content signals the audio doesn't surface — surprising claims, callbacks, named-entity reveals, "wait..." / "no way" / "look at this" beats.
 
-You're picking moments here, not committing to outputs yet — the same picks feed multiple modes below.
+For each candidate, write a one-line internal description. You're picking moments here, not committing to outputs yet — the same picks feed every mode below.
+
+**For unattended / batch runs** (no Claude in the loop), use a fallback picker:
+
+- `python3 scripts/auto_edl.py <workdir>` — a peak-only heuristic picker. Writes `auto_edl.json` ready to rename to `edl.json`. Decent for batch jobs; nowhere near as good as Claude reading the transcript.
+- `python3 scripts/claude_pick.py <workdir>` — calls the Anthropic API to do real picking with a non-interactive Claude. Needs `ANTHROPIC_API_KEY` in the environment. Uses prompt caching on the transcript so re-running for different modes (`shorts` vs `highlights`) is cheap. Best autonomous option.
 
 ---
 
