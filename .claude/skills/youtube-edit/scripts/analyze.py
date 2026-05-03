@@ -40,17 +40,21 @@ def probe_duration(src):
 
 
 def loudness_curve(src):
-    """Run ebur128 and parse momentary loudness samples."""
+    """Run ebur128 and parse momentary loudness samples.
+
+    Note: needs metadata=1 (inject into the filtergraph, which makes the
+    filter emit log lines) AND framelog=info (default verbose is suppressed
+    even at -loglevel verbose in this build).
+    """
     cmd = [
         "ffmpeg", "-nostats", "-hide_banner",
         "-i", str(src),
-        "-af", "ebur128=metadata=0:framelog=verbose",
+        "-af", "ebur128=metadata=1:framelog=info",
         "-f", "null", "-",
     ]
     proc = subprocess.run(cmd, capture_output=True)
     text = proc.stderr.decode("utf-8", errors="replace")
     samples = []
-    # ebur128 emits a "Parsed_ebur128" log line every ~100ms with t and M values
     for m in LOUDNESS_RE.finditer(text):
         t = float(m.group(1))
         v = m.group(2)
