@@ -74,6 +74,30 @@ def dedupe_rolling(cues):
     return out
 
 
+def dedupe_simple(cues):
+    """For whisper output (and other clean sources), drop only exact duplicates.
+
+    The rolling-prefix logic in dedupe_rolling can mangle word-level cues
+    where a word happens to be a prefix of the next ('the' → 'they' would
+    keep just 'y'). Whisper doesn't produce rolling captions so we only
+    need to filter exact dupes here.
+    """
+    out = []
+    last_text = ""
+    for c in cues:
+        t = c["text"]
+        if t == last_text:
+            continue
+        out.append({"start": round(c["start"], 2), "text": t})
+        last_text = t
+    return out
+
+
+def looks_like_youtube_auto(text):
+    """Heuristic: YouTube auto-caption files start with 'Kind: captions'."""
+    return "Kind: captions" in text[:200]
+
+
 def main():
     if len(sys.argv) != 2:
         sys.exit("usage: parse_transcript.py <workdir>")
@@ -84,8 +108,12 @@ def main():
     # Prefer manual over auto if both exist (manual filenames don't include .auto.)
     vtts.sort(key=lambda p: (".auto." in p.name, p.name))
     vtt = vtts[0]
-    cues = parse_vtt(vtt.read_text(encoding="utf-8"))
-    transcript = dedupe_rolling(cues)
+    raw = vtt.read_text(encoding="utf-8")
+    cues = parse_vtt(raw)
+    if looks_like_youtube_auto(raw):
+        transcript = dedupe_rolling(cues)
+    else:
+        transcript = dedupe_simple(cues)
     out = workdir / "transcript.json"
     out.write_text(json.dumps(transcript, indent=2))
     if transcript:

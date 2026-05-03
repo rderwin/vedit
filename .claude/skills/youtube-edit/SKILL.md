@@ -54,6 +54,33 @@ python3 .claude/skills/youtube-edit/scripts/parse_transcript.py <workdir>
 
 Both produce `<workdir>/transcript.json` — a list of `{start, text}` deduped from rolling captions.
 
+**Whisper options worth knowing:**
+
+- `transcribe.sh --words <workdir>` — word-level VTT (one word per cue). Pair with `style.caption_mode: "word"` in the EDL for millisecond-accurate TikTok-style captions.
+- `transcribe.sh --prompt "..." <workdir>` — initial prompt to bias whisper's vocabulary. By default the script auto-builds a prompt from `source.info.json` (title, uploader, tags). For a chess stream where you want to avoid "chess"/"chest" mishears: `--prompt "Chess stream. ELO, blunder, rook, bishop, knight, queen, pawn, mate, fork, pin"`. A `<workdir>/whisper_prompt.txt` is also auto-detected and appended.
+
+### 2b. Fix transcript mishears (run every time)
+
+```bash
+python3 .claude/skills/youtube-edit/scripts/fix_transcript.py <workdir>
+```
+
+This is part of the standard workflow — always run it before the picking step. It auto-detects domain context from `source.info.json` *and* the transcript itself: if "chess" appears 26 times and "chest" only 4, the script replaces "chest" → "chess" everywhere. (For the live test on the Billy Markus chess stream this caught all four "chest" mishears.)
+
+User overrides go in `<workdir>/transcript_fixes.json`:
+
+```json
+{
+  "replace": {"chest": "chess", "Bily": "Billy", "git hub": "GitHub"},
+  "case_insensitive": true,
+  "whole_word": true
+}
+```
+
+The original transcript is backed up to `transcript.raw.json` before any change, so re-running with different fixes is safe. `--dry-run` previews changes without writing.
+
+If you find a recurring mishear during a session, add it to `transcript_fixes.json` and re-run; downstream steps (signals, EDL, captions) all pick up the corrected text automatically.
+
 ### 3. Extract editing signals
 
 ```bash
