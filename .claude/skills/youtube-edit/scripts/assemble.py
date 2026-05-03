@@ -19,6 +19,7 @@ import json
 import pathlib
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 
@@ -83,6 +84,7 @@ def concat(parts, out):
         "-movflags", "+faststart",
         str(out),
     ])
+    listfile.unlink(missing_ok=True)
 
 
 def main():
@@ -120,6 +122,7 @@ def main():
         else:
             concat(parts, main_out)
         print("main → {}".format(main_out))
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
     # Clips.
     for i, clip in enumerate(edl.get("clips") or [], 1):
