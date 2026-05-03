@@ -104,6 +104,66 @@ def render_title_card(text, width, height, accent="#FFD24A"):
     return img
 
 
+def render_end_card(title, subtitle, cta, width, height, accent="#FFD24A"):
+    """Branded end-screen card: title, subtitle, CTA, and a fat accent stripe.
+
+    Used as a 3-4s appended segment at the tail of the main compilation.
+    Returns an RGB image (no transparency — it's a full frame).
+    """
+    img = Image.new("RGB", (width, height), (16, 18, 22))
+    draw = ImageDraw.Draw(img)
+    base = min(width, height)
+
+    title_size = max(60, int(base * 0.10))
+    sub_size = max(28, int(base * 0.038))
+    cta_size = max(34, int(base * 0.046))
+
+    tfont = _font(title_size)
+    sfont = _font(sub_size)
+    cfont = _font(cta_size)
+
+    # Position the title block at vertical center (slightly above).
+    side_pad = int(width * 0.08)
+    tw = draw.textlength(title or "", font=tfont)
+    sw = draw.textlength(subtitle or "", font=sfont)
+    cw = draw.textlength(cta or "", font=cfont)
+
+    block_h = (
+        title_size
+        + (int(sub_size * 1.4) if subtitle else 0)
+        + (int(cta_size * 1.6) if cta else 0)
+    )
+    y = (height - block_h) // 2
+
+    if title:
+        draw.text(((width - tw) // 2, y), title,
+                  fill=(245, 245, 248), font=tfont)
+        y += int(title_size * 1.05)
+
+    # Accent stripe between title and subtitle.
+    stripe_w = max(80, int(width * 0.12))
+    stripe_h = max(6, int(base * 0.010))
+    sx = (width - stripe_w) // 2
+    draw.rectangle(
+        [(sx, y + int(sub_size * 0.2)), (sx + stripe_w, y + int(sub_size * 0.2) + stripe_h)],
+        fill=_hex_rgba(accent)[:3],
+    )
+    y += int(sub_size * 0.7)
+
+    if subtitle:
+        draw.text(((width - sw) // 2, y), subtitle,
+                  fill=(180, 180, 190), font=sfont)
+        y += int(sub_size * 1.55)
+
+    if cta:
+        # CTA in accent color, centered at bottom third.
+        cta_y = int(height * 0.78)
+        draw.text(((width - cw) // 2, cta_y), cta,
+                  fill=_hex_rgba(accent)[:3], font=cfont)
+
+    return img
+
+
 def render_caption(text, width, height, style="minimal", accent="#FFD24A"):
     """Centered, big, bold short-form caption (TikTok / Reels style).
 

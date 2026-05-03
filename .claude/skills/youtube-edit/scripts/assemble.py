@@ -48,7 +48,7 @@ import sys
 
 # render_text lives next to this script; make sure it's importable
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from render_text import render_title_card, render_caption
+from render_text import render_title_card, render_caption, render_end_card
 
 
 SLUG_RE = re.compile(r"[^a-zA-Z0-9]+")
@@ -322,6 +322,50 @@ def _is_filler(word):
     return word.lower().strip(".,!?;:") in {"um", "uh", "uhh", "uhm", "er"}
 
 
+def make_end_card_part(spec, dims, accent, out_path):
+    """Render a 3–4s end card as an mp4 to use as the last main segment."""
+    w, h = dims
+    duration = float(spec.get("duration", 3.5))
+    img = render_end_card(
+        spec.get("title", ""),
+        spec.get("subtitle", ""),
+        spec.get("cta", ""),
+        w, h, accent=accent,
+    )
+    png_path = out_path.parent / "end_card.png"
+    img.save(png_path)
+    run([
+        "ffmpeg", "-y",
+        "-loop", "1", "-framerate", "30", "-t", "{:.3f}".format(duration),
+        "-i", str(png_path),
+        "-f", "lavfi", "-t", "{:.3f}".format(duration),
+        "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+        "-c:v", "libx264", "-preset", "medium", "-crf", "19",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "192k",
+        "-shortest", "-movflags", "+faststart",
+        str(out_path),
+    ])
+    png_path.unlink(missing_ok=True)
+    return out_path, duration
+
+
+def _atempo_chain(speed):
+    """ffmpeg atempo accepts 0.5..2.0 per filter; chain stages for any ratio."""
+    if 0.5 <= speed <= 2.0:
+        return "atempo={:.4f}".format(speed)
+    parts = []
+    s = speed
+    while s > 2.0:
+        parts.append("atempo=2.0")
+        s /= 2.0
+    while s < 0.5:
+        parts.append("atempo=0.5")
+        s /= 0.5
+    parts.append("atempo={:.4f}".format(s))
+    return ",".join(parts)
+
+
 def render_clip(
     src,
     start,
@@ -343,6 +387,9 @@ def render_clip(
     logo_position="top_right",
     logo_opacity=0.85,
     logo_scale=0.10,
+    lut_path=None,
+    speed=1.0,
+    audio_clean=False,
 ):
     """Render one polished clip. Returns the output path."""
     dur = end - start
@@ -357,6 +404,20 @@ def render_clip(
     # Build the video filter chain on stream [0:v]. Filters within a chain
     # flow with commas; chains are separated with semicolons.
     color_grade = LOOKS.get(look, LOOKS["default"])
+    if lut_path is not None:
+        # Apply 3D LUT BEFORE the local color grade so the LUT establishes
+        # the look and the grade just nudges it.
+        lut_filter = "lut3d=file='{}'".format(str(lut_path).replace("'", r"\'"))
+        color_grade = lut_filter + "," + color_grade
+    # Speed change via setpts (video) — audio handled below with atempo.
+    # `fps=30` after setpts is essential: setpts only changes PTS values,
+    # but ffmpeg's muxer needs a constant frame rate to compute the
+    # correct output duration. Without it, fast-forwards don't actually
+    # shorten the file.
+    if speed != 1.0:
+        color_grade = color_grade + ",setpts={:.4f}*PTS,fps=30".format(
+            1.0 / speed
+        )
     if vertical:
         fit_filter = VERT_FITS.get(vertical_fit, VERT_BLUR_FILL)
         full_chain = "[0:v]" + color_grade + "," + fit_filter
@@ -368,13 +429,19 @@ def render_clip(
     next_input_idx = 1
 
     # PNG inputs get `-loop 1 -t DUR -framerate 30` so they become a
-    # bounded video stream. Without this, the PNG is a single frame, which
-    # breaks fade (sees one PTS) and lets the overlay-held frame outlive
-    # the source.
+    # bounded video stream. Important: bound to the EFFECTIVE duration
+    # (dur/speed), so a sped-up clip's overlay PNGs don't outlive the
+    # video (overlay's default behavior is to extend to the longer input).
     fps = 30
-    png_input_prefix = ["-loop", "1", "-framerate", str(fps), "-t", "{:.3f}".format(dur)]
+    eff_dur = dur / speed
+    png_input_prefix = [
+        "-loop", "1", "-framerate", str(fps),
+        "-t", "{:.3f}".format(eff_dur),
+    ]
 
-    # Caption overlays (captions list of {start,end,text} relative to clip)
+    # Caption overlays (captions list of {start,end,text} relative to clip).
+    # Caption timestamps are in source seconds; the output's `t` coordinate
+    # is source_t / speed, so divide by speed when speed != 1.
     if captions:
         for i, c in enumerate(captions):
             cap_png = work_assets / "cap_{}.png".format(i)
@@ -391,8 +458,8 @@ def render_clip(
             ).format(
                 prev=prev_label,
                 idx=next_input_idx,
-                a=round(c["start"], 3),
-                b=round(c["end"], 3),
+                a=round(c["start"] / speed, 3),
+                b=round(c["end"] / speed, 3),
                 nl=new_label,
             )
             next_input_idx += 1
@@ -465,12 +532,24 @@ def render_clip(
     else:
         full_chain += ";{}null[v]".format(pre_logo_label)
 
-    # Audio: short fade in/out, optional loudnorm (skip on parts that will
-    # be normalized after concat to avoid double-normalization).
-    a_filter_parts = [
-        "afade=t=in:st=0:d=0.08",
-        "afade=t=out:st={:.3f}:d=0.18".format(max(0.0, dur - 0.18)),
-    ]
+    # Audio chain. Order matters:
+    #   1. (optional) afftdn FFT-based denoise — runs before everything else
+    #      so loudnorm doesn't normalize against noise.
+    #   2. atempo for speed change (must come before fades since it changes
+    #      the duration).
+    #   3. fades at boundaries.
+    #   4. (per-clip) loudnorm to social target.
+    a_filter_parts = []
+    if audio_clean:
+        # afftdn defaults are conservative; nr=12 is gentle, nf=-30 noise floor.
+        a_filter_parts.append("afftdn=nr=12:nf=-30")
+    if speed != 1.0:
+        # atempo accepts 0.5..2.0 per stage; chain stages for bigger ratios.
+        a_filter_parts.append(_atempo_chain(speed))
+    a_filter_parts.append("afade=t=in:st=0:d=0.08")
+    a_filter_parts.append(
+        "afade=t=out:st={:.3f}:d=0.18".format(max(0.0, eff_dur - 0.18))
+    )
     if not is_main_part:
         a_filter_parts.append(LOUDNORM_CLIP)
     a_filter = ",".join(a_filter_parts)
@@ -656,6 +735,27 @@ def main():
     logo_opacity = float(style.get("logo_opacity", 0.85))
     logo_scale = float(style.get("logo_scale", 0.10))
 
+    # 3D LUT detection: prefer style.lut path; otherwise look for lut.cube
+    # in the workdir.
+    lut_path = None
+    style_lut = style.get("lut")
+    if style_lut:
+        cand = pathlib.Path(style_lut)
+        if not cand.is_absolute():
+            cand = workdir / style_lut
+        if cand.exists():
+            lut_path = cand
+        else:
+            sys.exit("style.lut not found: {}".format(cand))
+    elif (workdir / "lut.cube").exists():
+        lut_path = workdir / "lut.cube"
+
+    # Audio cleanup default — on for podcast-y presets, off otherwise.
+    default_audio_clean = bool(
+        style.get("audio_clean",
+                  preset_name in {"podcast", "documentary", "cinematic"})
+    )
+
     print(
         "[style] preset={} look={} vfit={} caps={}/{} title={} music={} logo={}".format(
             preset_name, default_look, default_vertical_fit,
@@ -684,6 +784,7 @@ def main():
             assets = tmp_dir / "main_{:03d}_assets".format(i)
             assets.mkdir(exist_ok=True)
             part = tmp_dir / "main_part_{:03d}.mp4".format(i)
+            seg_speed = float(seg.get("speed", 1.0))
             render_clip(
                 src,
                 float(seg["start"]),
@@ -697,16 +798,33 @@ def main():
                 is_main_part=True,
                 title_anim=default_title_anim,
                 accent=default_accent,
-                look=default_look,
+                look=seg.get("look", default_look),
                 logo_path=logo_path,
                 logo_position=logo_position,
                 logo_opacity=logo_opacity,
                 logo_scale=logo_scale,
+                lut_path=lut_path,
+                speed=seg_speed,
+                audio_clean=default_audio_clean,
             )
             parts.append(part)
-            durations.append(float(seg["end"]) - float(seg["start"]))
+            # Effective duration after speed change (matters for xfade offsets).
+            seg_dur = (float(seg["end"]) - float(seg["start"])) / seg_speed
+            durations.append(seg_dur)
             # transition[i] = transition INTO segment i (used between i-1 and i)
             transitions.append(seg.get("transition", default_main_transition))
+
+        # Optional end-screen card appended as a final segment.
+        end_card_spec = style.get("end_card")
+        if end_card_spec:
+            ec_path = tmp_dir / "main_end_card.mp4"
+            ec_path, ec_dur = make_end_card_part(
+                end_card_spec, src_dims, default_accent, ec_path,
+            )
+            parts.append(ec_path)
+            durations.append(ec_dur)
+            transitions.append(end_card_spec.get("transition", "fadeblack"))
+
         main_out = out_dir / "main.mp4"
         assemble_main(parts, main_out, durations,
                       music_path=music_path, transitions=transitions)
@@ -734,6 +852,9 @@ def main():
         accent = clip.get("accent", default_accent)
         look = clip.get("look", default_look)
 
+        clip_speed = float(clip.get("speed", 1.0))
+        clip_audio_clean = bool(clip.get("audio_clean", default_audio_clean))
+
         # landscape version
         assets_l = tmp_dir / "clip_{:02d}_l".format(i)
         assets_l.mkdir(exist_ok=True)
@@ -751,6 +872,9 @@ def main():
             logo_position=logo_position,
             logo_opacity=logo_opacity,
             logo_scale=logo_scale,
+            lut_path=lut_path,
+            speed=clip_speed,
+            audio_clean=clip_audio_clean,
         )
         print("clip → {}".format(clips_dir / name))
 
@@ -781,6 +905,9 @@ def main():
                 logo_position=logo_position,
                 logo_opacity=logo_opacity,
                 logo_scale=logo_scale,
+                lut_path=lut_path,
+                speed=clip_speed,
+                audio_clean=clip_audio_clean,
             )
             print("clip → {}".format(vert_dir / name))
 
