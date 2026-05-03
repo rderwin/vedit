@@ -428,6 +428,76 @@ def _is_filler(word):
     return word.lower().strip(".,!?;:") in {"um", "uh", "uhh", "uhm", "er"}
 
 
+def export_audio(src_mp4, out_path, quality="balanced"):
+    """Strip video and emit an .m4a — for podcast distribution."""
+    q = QUALITY_PRESETS.get(quality, QUALITY_PRESETS["balanced"])
+    run([
+        "ffmpeg", "-y", "-i", str(src_mp4),
+        "-vn",
+        "-c:a", "aac", "-b:a", q["audio_kbps"] + "k",
+        "-movflags", "+faststart",
+        str(out_path),
+    ])
+
+
+def export_srt(transcript, out_path, *, max_chars=42, max_dur=5.0):
+    """Emit an SRT subtitle file from transcript.json.
+
+    SRT is the lingua franca of platform subtitle uploads (YouTube, Vimeo,
+    Premiere) and gets you closed captions without re-uploading the video.
+    Phrases are wrapped to ~`max_chars` per line and capped at `max_dur`
+    seconds so subtitles don't sit on screen too long.
+    """
+    if not transcript:
+        return False
+    cues = []
+    for i, e in enumerate(transcript):
+        start = float(e["start"])
+        # End of cue = next entry's start, capped at max_dur.
+        if i + 1 < len(transcript):
+            end = float(transcript[i + 1]["start"])
+        else:
+            end = start + max_dur
+        end = min(end, start + max_dur)
+        text = _wrap_subtitle(e["text"].strip(), max_chars)
+        cues.append((start, end, text))
+
+    def fmt_ts_srt(s):
+        ms = int(round(s * 1000))
+        h, ms = divmod(ms, 3_600_000)
+        m, ms = divmod(ms, 60_000)
+        sec, ms = divmod(ms, 1_000)
+        return "{:02d}:{:02d}:{:02d},{:03d}".format(h, m, sec, ms)
+
+    lines = []
+    for n, (a, b, text) in enumerate(cues, 1):
+        lines.append(str(n))
+        lines.append("{} --> {}".format(fmt_ts_srt(a), fmt_ts_srt(b)))
+        lines.append(text)
+        lines.append("")
+    out_path.write_text("\n".join(lines))
+    return True
+
+
+def _wrap_subtitle(text, max_chars):
+    """Greedy wrap to ≤2 lines of ~max_chars each."""
+    words = text.split()
+    if not words:
+        return ""
+    lines = [""]
+    for w in words:
+        if not lines[-1]:
+            lines[-1] = w
+        elif len(lines[-1]) + 1 + len(w) <= max_chars:
+            lines[-1] += " " + w
+        elif len(lines) < 2:
+            lines.append(w)
+        else:
+            # 3rd line — pile rest onto line 2 (will overflow but rare).
+            lines[-1] += " " + w
+    return "\n".join(lines)
+
+
 def export_format(src_mp4, fmt, out_path, *, vertical_fit="blur_fill",
                   quality="balanced"):
     """Re-encode `src_mp4` into one of the export formats.
@@ -1005,18 +1075,38 @@ def main():
     logo_opacity = float(style.get("logo_opacity", 0.85))
     logo_scale = float(style.get("logo_scale", 0.10))
 
-    # 3D LUT detection: prefer style.lut path; otherwise look for lut.cube
-    # in the workdir.
+    # 3D LUT detection. style.lut resolves in this order:
+    #   1. Bundled name (e.g. "cinematic" → luts/cinematic.cube next to the
+    #      skill scripts).
+    #   2. Absolute or workdir-relative path to a .cube file.
+    # If style.lut is unset, we look for lut.cube in the workdir.
     lut_path = None
     style_lut = style.get("lut")
     if style_lut:
-        cand = pathlib.Path(style_lut)
-        if not cand.is_absolute():
-            cand = workdir / style_lut
-        if cand.exists():
-            lut_path = cand
+        bundled = pathlib.Path(__file__).resolve().parent.parent / "luts" / (
+            style_lut + ".cube"
+        )
+        if bundled.exists():
+            lut_path = bundled
         else:
-            sys.exit("style.lut not found: {}".format(cand))
+            cand = pathlib.Path(style_lut)
+            if not cand.is_absolute():
+                cand = workdir / style_lut
+            if cand.exists():
+                lut_path = cand
+            else:
+                bundled_dir = bundled.parent
+                bundled_names = sorted(
+                    p.stem for p in bundled_dir.glob("*.cube")
+                ) if bundled_dir.exists() else []
+                sys.exit(
+                    "style.lut not found: {!r}. Tried bundled name (have: {}) "
+                    "and path {}".format(
+                        style_lut,
+                        ", ".join(bundled_names) or "(none)",
+                        cand,
+                    )
+                )
     elif (workdir / "lut.cube").exists():
         lut_path = workdir / "lut.cube"
 
@@ -1120,20 +1210,37 @@ def main():
                       quality=default_quality)
         print("main → {}".format(main_out))
 
-        # Optional alternate-aspect exports of the main compilation.
+        # Optional alternate-aspect exports + sidecar files for the main.
         export_formats = style.get("export_formats") or []
         for fmt in export_formats:
             if fmt == "square":
                 fmt_out = out_dir / "main_square.mp4"
+                export_format(main_out, fmt, fmt_out,
+                              vertical_fit=default_vertical_fit,
+                              quality=default_quality)
+                print("main → {}".format(fmt_out))
             elif fmt == "vertical":
                 fmt_out = out_dir / "main_vertical.mp4"
+                export_format(main_out, fmt, fmt_out,
+                              vertical_fit=default_vertical_fit,
+                              quality=default_quality)
+                print("main → {}".format(fmt_out))
+            elif fmt == "audio":
+                fmt_out = out_dir / "main.m4a"
+                export_audio(main_out, fmt_out, quality=default_quality)
+                print("main → {}".format(fmt_out))
+            elif fmt == "srt":
+                fmt_out = out_dir / "main.srt"
+                # Note: this exports the FULL source transcript, not the
+                # compilation timeline. For accurate subs aligned to the
+                # cuts, we'd need to remap cue times through the EDL — that's
+                # a TODO. This is still useful as a "what was said" sidecar.
+                if export_srt(transcript, fmt_out):
+                    print("main → {} (full source transcript)".format(fmt_out))
+                else:
+                    print("[export] no transcript — skipping srt")
             else:
                 print("[export] skipping unknown format: " + fmt)
-                continue
-            export_format(main_out, fmt, fmt_out,
-                          vertical_fit=default_vertical_fit,
-                          quality=default_quality)
-            print("main → {}".format(fmt_out))
 
     # ---- clips ----
     for i, clip in enumerate(edl.get("clips") or [], 1):
