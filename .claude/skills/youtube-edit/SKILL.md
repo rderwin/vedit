@@ -81,6 +81,28 @@ The original transcript is backed up to `transcript.raw.json` before any change,
 
 If you find a recurring mishear during a session, add it to `transcript_fixes.json` and re-run; downstream steps (signals, EDL, captions) all pick up the corrected text automatically.
 
+### 2c. Smart vertical crop (optional — talking-head content)
+
+If the source has a clearly identifiable speaker on camera, run face tracking once so the assembler can crop a 9:16 window that *follows the speaker* rather than locking to center:
+
+```bash
+uv run --quiet .claude/skills/youtube-edit/scripts/smart_crop.py <workdir>
+```
+
+Writes `<workdir>/crop_track.json` with smoothed face-center samples (every 0.5s by default, `--every <seconds>` to change). Then in the EDL set `style.vertical_fit: "face_track"` and the assembler uses a time-varying crop expression that tracks the speaker. Same killer feature as CapCut / Submagic, free.
+
+For screen-recorded content (gameplay, dashboards, chess.com) skip this step — `vertical_fit: "fill_height"` is what you want.
+
+### 2d. Detect music beats (optional — only if you have a music track)
+
+If you've dropped a `music.<ext>` in the workdir for the bed, you can also run beat detection so cuts can land on the music:
+
+```bash
+uv run --quiet .claude/skills/youtube-edit/scripts/beats.py <workdir>
+```
+
+Writes `<workdir>/beats.json` with `tempo_bpm` and beat times. Set `style.beat_sync: true` in the EDL to auto-snap each main segment's end to the nearest beat (within ±1.5s). Cuts feel musical without the picker thinking about it.
+
 ### 3. Extract editing signals
 
 ```bash
@@ -187,7 +209,7 @@ Outputs in `<workdir>/out/`: `main.mp4`, `clips/NN_slug.mp4`, `clips_vertical/NN
 
 **Style key reference:**
 
-- `vertical_fit` — `blur_fill` (talking-head video; subject doesn't get cropped) or `fill_height` (screen-recorded content; the center column fills the 9:16 frame).
+- `vertical_fit` — `blur_fill` (talking-head; doesn't crop the subject), `fill_height` (screen-recorded; center column fills 9:16), or `face_track` (smoothly follows the speaker; requires `crop_track.json` from `smart_crop.py`).
 - `caption_style` — `minimal` (white text + thick black stroke), `bold` (white text on dark rounded pill), `pop` (black text on accent-colored pill, MrBeast-adjacent).
 - `caption_mode` — `phrase` (≤4-word chunks) or `word` (one word per chunk, TikTok-2024 style; falls back to phrase if more than 80 words in a clip).
 - `title_anim` — `fade` (alpha-only) or `slide` (slide in from the left + fade).
@@ -195,6 +217,11 @@ Outputs in `<workdir>/out/`: `main.mp4`, `clips/NN_slug.mp4`, `clips_vertical/NN
 - `lut` — path (relative to workdir or absolute) to a `.cube` 3D LUT applied before the local color grade. Free LUTs at lutify.me/free-luts and freshluts.com.
 - `main_transition` — default xfade type between main segments. Any of the 35+ supported types: `fade`, `fadeblack`, `fadewhite`, `dissolve`, `pixelize`, `wipeleft`/`right`/`up`/`down`, `slideleft`/`right`/`up`/`down`, `circleopen`/`close`, `radial`, `squeezeh`/`v`, `zoomin`, etc.
 - `accent` — hex color used by title stripes, `pop` caption pills, end-card stripe & CTA, thumbnails.
+- `auto_zoom` — subtle ken-burns ramp (1.0 → 1.06) on each top-loudness peak inside the clip. Pulls peaks from `signals.json`.
+- `stabilize` — runs `deshake` on the source. Single-pass; for shaky footage. Off by default.
+- `beat_sync` — when a `beats.json` is present, snap each main segment's end to the nearest beat. Off by default.
+- `quality` — encoder preset: `fast` (iterate quickly), `balanced` (default), `high` (final delivery), `h265` (smaller files), `archival` (visually lossless).
+- `export_formats` — list of additional aspect ratios to render alongside `main.mp4`. Choices: `square` (1080×1080), `vertical` (1080×1920). One EDL → many deliverables.
 - `use_music` — drop a `music.mp3`/`.m4a`/`.wav`/`.ogg` in the workdir; the main compilation gets a sidechain-ducked music bed. See [`MUSIC.md`](MUSIC.md) for legal sources.
 - `audio_clean` — runs `afftdn` (FFT-based denoise) before loudnorm. Default on for podcast/documentary/cinematic presets.
 - `sfx_on_title` — synthesized whoosh accent at the start of each title-in. Default off.
@@ -446,13 +473,21 @@ See [`ROADMAP.md`](ROADMAP.md) for the full landscape of features and the open-s
 - ✅ Auto-EDL generator from signals (`auto_edl.py`)
 - ✅ Multi-URL supercut script
 
+**Recently shipped:**
+
+- ✅ Smart vertical face-tracking — `vertical_fit: "face_track"` follows the speaker
+- ✅ Auto-zoom on reaction peaks — subtle kenburns at top loudness peaks
+- ✅ Stabilization — single-pass `deshake`
+- ✅ Beat-synced cuts — librosa beat detection + auto-snap segment ends
+- ✅ Multi-format export — square + vertical alongside main from one EDL
+- ✅ Quality presets — fast / balanced / high / h265 / archival
+- ✅ Word-level transcription mode (`transcribe.sh --words`) + word captions in EDL
+- ✅ Transcript hygiene (auto-fix mishears like chest → chess)
+
 **On the way (see ROADMAP.md):**
 
-- ⏳ Word-level captions with active-word highlight (needs `whisper-cli -ml 1` or WhisperX)
-- ⏳ Smart vertical crop following the speaker (mediapipe face detection)
-- ⏳ Auto-zoom on reaction peaks (kenburns ramp during top loudness peaks)
-- ⏳ Stabilization (vidstab two-pass)
-- ⏳ Beat-synced cuts (librosa)
 - ⏳ Speaker diarization labels (pyannote / WhisperX)
-- ⏳ Multi-format export (square + vertical + landscape from one EDL)
+- ⏳ Two-pass `vidstab` (better than `deshake`; needs custom-built ffmpeg)
+- ⏳ 3D LUT presets shipped with the skill (free CC0 LUTs bundled)
+- ⏳ Local LLM picker (ollama / llama3.1 reads transcript+signals → starter EDL)
 - ⏳ Auto-upload to YouTube / TikTok / Shorts
