@@ -188,7 +188,49 @@ VERT_FILL_HEIGHT = (
 VERT_FITS = {
     "blur_fill": VERT_BLUR_FILL,
     "fill_height": VERT_FILL_HEIGHT,
+    # face_track is handled separately — needs the per-clip face_track
+    # samples to build a time-varying crop expression. See build_face_track_filter.
+    "face_track": "FACE_TRACK_PLACEHOLDER",
 }
+
+
+def build_face_track_filter(track, clip_start, clip_end, src_w, src_h):
+    """For a 9:16 vertical crop that follows the speaker.
+
+    Crop a (src_h * 9/16) wide × src_h tall window from the source,
+    centered on the smoothed face x at each sample, then scale to
+    1080×1920. The crop x is a piecewise step expression built from the
+    track samples that fall inside the clip.
+    """
+    samples = [s for s in track.get("samples") or []
+               if clip_start <= s["t"] <= clip_end + 0.01]
+    if not samples:
+        # No samples inside window — fall back to centered crop.
+        crop_w = int(src_h * VERT_W / VERT_H)  # 9/16 of source height
+        x_expr = str((src_w - crop_w) // 2)
+    else:
+        crop_w = int(src_h * VERT_W / VERT_H)
+        half = crop_w // 2
+        # Build (rel_time, clamped_x) pairs.
+        pts = []
+        for s in samples:
+            rel_t = max(0.0, s["t"] - clip_start)
+            x = max(0, min(src_w - crop_w, int(s["x"]) - half))
+            pts.append((rel_t, x))
+        # Cascade: starts with the LAST sample's x as the default for
+        # t >= last threshold, then walks backward inserting if-tests.
+        x_expr = str(pts[-1][1])
+        for i in range(len(pts) - 2, -1, -1):
+            next_t = pts[i + 1][0]
+            x = pts[i][1]
+            x_expr = "if(lt(t\\,{:.3f})\\,{}\\,{})".format(next_t, x, x_expr)
+    return (
+        "crop={cw}:{ch}:'{xe}':0,"
+        "scale={W}:{H}:flags=lanczos,setsar=1[base]"
+    ).format(
+        cw=crop_w, ch=src_h, xe=x_expr,
+        W=VERT_W, H=VERT_H,
+    )
 
 
 def slugify(s, fallback="clip"):
@@ -487,6 +529,7 @@ def render_clip(
     sfx_on_title=False,
     zoom_peaks=None,
     stabilize=False,
+    face_track=None,
 ):
     """Render one polished clip. Returns the output path."""
     dur = end - start
@@ -521,7 +564,17 @@ def render_clip(
             1.0 / speed
         )
     if vertical:
-        fit_filter = VERT_FITS.get(vertical_fit, VERT_BLUR_FILL)
+        if vertical_fit == "face_track" and face_track is not None:
+            fit_filter = build_face_track_filter(
+                face_track, start, end,
+                src_w=src_dims[0], src_h=src_dims[1],
+            )
+        else:
+            fit_filter = VERT_FITS.get(vertical_fit, VERT_BLUR_FILL)
+            if fit_filter == "FACE_TRACK_PLACEHOLDER":
+                # Asked for face_track but no track loaded — fall back.
+                print("[face_track] no crop_track.json — falling back to blur_fill")
+                fit_filter = VERT_BLUR_FILL
         full_chain = "[0:v]" + color_grade + "," + fit_filter
     else:
         full_chain = "[0:v]" + color_grade + "[base]"
@@ -855,6 +908,12 @@ def main():
     if spath.exists():
         signals = json.loads(spath.read_text())
 
+    # Load crop_track.json if it exists (used by vertical_fit="face_track").
+    face_track = None
+    ftpath = workdir / "crop_track.json"
+    if ftpath.exists():
+        face_track = json.loads(ftpath.read_text())
+
     if default_vertical_fit not in VERT_FITS:
         sys.exit("unknown vertical_fit: {!r} (valid: {})".format(
             default_vertical_fit, ", ".join(sorted(VERT_FITS))))
@@ -1052,6 +1111,7 @@ def main():
             sfx_on_title=clip_sfx,
             zoom_peaks=clip_zoom_peaks,
             stabilize=bool(clip.get("stabilize", default_stabilize)),
+            face_track=face_track,
         )
         print("clip → {}".format(clips_dir / name))
 
@@ -1088,6 +1148,7 @@ def main():
                 sfx_on_title=clip_sfx,
                 zoom_peaks=clip_zoom_peaks,
                 stabilize=bool(clip.get("stabilize", default_stabilize)),
+                face_track=face_track,
             )
             print("clip → {}".format(vert_dir / name))
 
