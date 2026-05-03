@@ -1,0 +1,9 @@
+# Per-run output
+vedit-runs/
+
+# macOS
+.DS_Store
+
+# Python scratch
+__pycache__/
+*.pyc
