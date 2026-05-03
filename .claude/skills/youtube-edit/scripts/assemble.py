@@ -318,8 +318,102 @@ def caption_chunks_for(
     return out
 
 
+def zoom_expression(peaks, *, max_zoom=1.06, dur=0.8):
+    """Build a time-varying zoom factor for ffmpeg's `zoompan` filter.
+
+    zoompan is the only filter that supports per-frame zoom evaluation.
+    Its expression uses `time` (output timestamp in seconds), NOT `t`.
+
+    Each peak ramps zoom up to `max_zoom` over `dur/2` seconds then back
+    down over `dur/2`. Multiple peaks combine via max so overlaps just
+    hold the highest zoom rather than compounding.
+
+    Backslashes escape commas so the expression sits cleanly inside a
+    filter argument without being split on commas.
+    """
+    if not peaks:
+        return "1"
+    delta = max_zoom - 1.0
+    triangles = [
+        "max(0\\,1-2*abs(time-{:.3f})/{:.3f})".format(float(p), float(dur))
+        for p in peaks
+    ]
+    summed = "+".join(triangles)
+    return "1+{:.4f}*min(1\\,{})".format(delta, summed)
+
+
+def peaks_inside_clip(signals, start, end, *, top_n=3, min_lufs=-25.0):
+    """Pick up to `top_n` loudness peaks that fall inside [start, end].
+
+    Returns peak times relative to the clip start. Filters out peaks
+    quieter than `min_lufs` (don't zoom on background noise).
+    """
+    peaks = []
+    for p in (signals or {}).get("loud_peaks") or []:
+        t = float(p["t"])
+        if start <= t <= end and float(p["lufs"]) >= min_lufs:
+            peaks.append((t - start, float(p["lufs"])))
+    # Loudest first.
+    peaks.sort(key=lambda x: -x[1])
+    return [t for t, _ in peaks[:top_n]]
+
+
 def _is_filler(word):
     return word.lower().strip(".,!?;:") in {"um", "uh", "uhh", "uhm", "er"}
+
+
+def export_format(src_mp4, fmt, out_path, *, vertical_fit="blur_fill"):
+    """Re-encode `src_mp4` into one of the export formats.
+
+    fmt:
+      'square'   — 1080×1080, center-cropped
+      'vertical' — 1080×1920, using either blur_fill (fit width, blur bg)
+                   or fill_height (fit height, crop sides)
+    """
+    if fmt == "square":
+        vf = (
+            "scale=1080:1080:force_original_aspect_ratio=increase,"
+            "crop=1080:1080,setsar=1"
+        )
+    elif fmt == "vertical":
+        if vertical_fit == "fill_height":
+            vf = (
+                "scale=1080:1920:force_original_aspect_ratio=increase,"
+                "crop=1080:1920,setsar=1"
+            )
+        else:
+            vf = (
+                "split=2[bgsrc][fgsrc];"
+                "[bgsrc]scale=1080:1920:force_original_aspect_ratio=increase,"
+                "crop=1080:1920,gblur=sigma=25[bg];"
+                "[fgsrc]scale=1080:-2:force_original_aspect_ratio=decrease[fg];"
+                "[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1"
+            )
+    else:
+        raise ValueError("unknown export format: " + fmt)
+
+    use_complex = fmt == "vertical" and vertical_fit != "fill_height"
+    if use_complex:
+        run([
+            "ffmpeg", "-y", "-i", str(src_mp4),
+            "-filter_complex", "[0:v]" + vf + "[v]",
+            "-map", "[v]", "-map", "0:a",
+            "-c:v", "libx264", "-preset", "medium", "-crf", "19",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "copy",
+            "-movflags", "+faststart",
+            str(out_path),
+        ])
+    else:
+        run([
+            "ffmpeg", "-y", "-i", str(src_mp4),
+            "-vf", vf,
+            "-c:v", "libx264", "-preset", "medium", "-crf", "19",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "copy",
+            "-movflags", "+faststart",
+            str(out_path),
+        ])
 
 
 def make_end_card_part(spec, dims, accent, out_path):
@@ -391,6 +485,8 @@ def render_clip(
     speed=1.0,
     audio_clean=False,
     sfx_on_title=False,
+    zoom_peaks=None,
+    stabilize=False,
 ):
     """Render one polished clip. Returns the output path."""
     dur = end - start
@@ -405,6 +501,11 @@ def render_clip(
     # Build the video filter chain on stream [0:v]. Filters within a chain
     # flow with commas; chains are separated with semicolons.
     color_grade = LOOKS.get(look, LOOKS["default"])
+    if stabilize:
+        # Single-pass deshake. Prepend so subsequent grade/scale work on
+        # stable frames. (For top-tier results, vidstab two-pass is better,
+        # but it requires a libvidstab-built ffmpeg — not in brew default.)
+        color_grade = "deshake=blocksize=8:edge=mirror," + color_grade
     if lut_path is not None:
         # Apply 3D LUT BEFORE the local color grade so the LUT establishes
         # the look and the grade just nudges it.
@@ -424,6 +525,21 @@ def render_clip(
         full_chain = "[0:v]" + color_grade + "," + fit_filter
     else:
         full_chain = "[0:v]" + color_grade + "[base]"
+
+    # Auto-zoom on reaction peaks. Inserts a time-varying zoompan AFTER
+    # the base video is composed but BEFORE captions/title/logo so we
+    # don't zoom into the title bar. zoom_peaks are clip-relative times
+    # in source seconds; map to output time when speed != 1.
+    if zoom_peaks:
+        peaks_out = [t / speed for t in zoom_peaks]
+        zexpr = zoom_expression(peaks_out)
+        # `d=1` keeps frame rate (one out per in). `s` is the canvas size.
+        full_chain = full_chain.replace(
+            "[base]",
+            ",zoompan=z='{z}':d=1:s={W}x{H}:fps=30[base]".format(
+                z=zexpr, W=out_w, H=out_h,
+            ),
+        )
 
     inputs = ["-i", str(src)]
     overlays = ["[base]"]
@@ -730,6 +846,14 @@ def main():
     default_accent = style.get("accent", "#FFD24A")
     drop_fillers = bool(style.get("drop_fillers", False))
     default_sfx_on_title = bool(style.get("sfx_on_title", False))
+    default_auto_zoom = bool(style.get("auto_zoom", False))
+    default_stabilize = bool(style.get("stabilize", False))
+
+    # Load signals.json (used for auto-zoom peaks).
+    signals = {}
+    spath = workdir / "signals.json"
+    if spath.exists():
+        signals = json.loads(spath.read_text())
 
     if default_vertical_fit not in VERT_FITS:
         sys.exit("unknown vertical_fit: {!r} (valid: {})".format(
@@ -808,6 +932,11 @@ def main():
             assets.mkdir(exist_ok=True)
             part = tmp_dir / "main_part_{:03d}.mp4".format(i)
             seg_speed = float(seg.get("speed", 1.0))
+            seg_auto_zoom = bool(seg.get("auto_zoom", default_auto_zoom))
+            seg_zoom_peaks = (
+                peaks_inside_clip(signals, float(seg["start"]), float(seg["end"]))
+                if seg_auto_zoom else None
+            )
             render_clip(
                 src,
                 float(seg["start"]),
@@ -830,6 +959,8 @@ def main():
                 speed=seg_speed,
                 audio_clean=default_audio_clean,
                 sfx_on_title=default_sfx_on_title,
+                zoom_peaks=seg_zoom_peaks,
+                stabilize=bool(seg.get("stabilize", default_stabilize)),
             )
             parts.append(part)
             # Effective duration after speed change (matters for xfade offsets).
@@ -853,6 +984,19 @@ def main():
         assemble_main(parts, main_out, durations,
                       music_path=music_path, transitions=transitions)
         print("main → {}".format(main_out))
+
+        # Optional alternate-aspect exports of the main compilation.
+        export_formats = style.get("export_formats") or []
+        for fmt in export_formats:
+            if fmt == "square":
+                fmt_out = out_dir / "main_square.mp4"
+            elif fmt == "vertical":
+                fmt_out = out_dir / "main_vertical.mp4"
+            else:
+                print("[export] skipping unknown format: " + fmt)
+                continue
+            export_format(main_out, fmt, fmt_out, vertical_fit=default_vertical_fit)
+            print("main → {}".format(fmt_out))
 
     # ---- clips ----
     for i, clip in enumerate(edl.get("clips") or [], 1):
@@ -879,6 +1023,11 @@ def main():
         clip_speed = float(clip.get("speed", 1.0))
         clip_audio_clean = bool(clip.get("audio_clean", default_audio_clean))
         clip_sfx = bool(clip.get("sfx_on_title", default_sfx_on_title))
+        clip_auto_zoom = bool(clip.get("auto_zoom", default_auto_zoom))
+        clip_zoom_peaks = (
+            peaks_inside_clip(signals, start, end)
+            if clip_auto_zoom else None
+        )
 
         # landscape version
         assets_l = tmp_dir / "clip_{:02d}_l".format(i)
@@ -901,6 +1050,8 @@ def main():
             speed=clip_speed,
             audio_clean=clip_audio_clean,
             sfx_on_title=clip_sfx,
+            zoom_peaks=clip_zoom_peaks,
+            stabilize=bool(clip.get("stabilize", default_stabilize)),
         )
         print("clip → {}".format(clips_dir / name))
 
@@ -935,6 +1086,8 @@ def main():
                 speed=clip_speed,
                 audio_clean=clip_audio_clean,
                 sfx_on_title=clip_sfx,
+                zoom_peaks=clip_zoom_peaks,
+                stabilize=bool(clip.get("stabilize", default_stabilize)),
             )
             print("clip → {}".format(vert_dir / name))
 
