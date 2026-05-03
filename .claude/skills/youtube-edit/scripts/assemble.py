@@ -656,11 +656,20 @@ def render_clip(
     stabilize=False,
     face_track=None,
     quality="balanced",
+    pip_path=None,
+    pip_position="bottom_right",
+    pip_scale=0.22,
+    pip_offset=24,
+    pip_round=True,
 ):
     """Render one polished clip. Returns the output path."""
     dur = end - start
     if dur <= 0:
         raise ValueError("non-positive duration: {} → {}".format(start, end))
+    # Effective duration (post-speed). Used for PNG bounds, audio fades,
+    # PiP trim, and the reverse-filter memory warning. abs() for negative
+    # speed (reverse).
+    eff_dur = dur / abs(speed) if speed != 0 else dur
 
     if vertical:
         out_w, out_h = VERT_W, VERT_H
@@ -685,6 +694,19 @@ def render_clip(
     # but ffmpeg's muxer needs a constant frame rate to compute the
     # correct output duration. Without it, fast-forwards don't actually
     # shorten the file.
+    #
+    # Negative `speed` reverses the clip. ffmpeg's `reverse` / `areverse`
+    # filters buffer the entire stream into memory — fine for short clips,
+    # expensive past ~30s. We use abs(speed) for the actual speed factor.
+    do_reverse = speed < 0
+    if do_reverse:
+        if eff_dur > 30:
+            print(
+                "[reverse] {:.0f}s clip — reverse buffers the whole "
+                "stream; this may use a lot of memory".format(eff_dur)
+            )
+        color_grade = color_grade + ",reverse"
+        speed = abs(speed)
     if speed != 1.0:
         color_grade = color_grade + ",setpts={:.4f}*PTS,fps=30".format(
             1.0 / speed
@@ -729,7 +751,6 @@ def render_clip(
     # (dur/speed), so a sped-up clip's overlay PNGs don't outlive the
     # video (overlay's default behavior is to extend to the longer input).
     fps = 30
-    eff_dur = dur / speed
     png_input_prefix = [
         "-loop", "1", "-framerate", str(fps),
         "-t", "{:.3f}".format(eff_dur),
@@ -797,6 +818,54 @@ def render_clip(
     else:
         full_chain += ";{}null{}".format(overlays[-1], pre_logo_label)
 
+    # Picture-in-picture overlay (e.g. webcam reaction cam). Goes BEFORE
+    # the logo so the logo sits on top of the PiP if they share a corner.
+    if pip_path:
+        # Add the PiP video as another input. We trim it to match the
+        # source's effective duration.
+        inputs += [
+            "-ss", "0",  # PiP starts at its own t=0; users can pre-trim
+            "-t", "{:.3f}".format(eff_dur),
+            "-i", str(pip_path),
+        ]
+        pip_w = max(80, int(out_w * pip_scale))
+        pip_pad = max(8, int(pip_offset))
+        positions = {
+            "top_right":    "x=W-w-{p}:y={p}".format(p=pip_pad),
+            "top_left":     "x={p}:y={p}".format(p=pip_pad),
+            "bottom_right": "x=W-w-{p}:y=H-h-{p}".format(p=pip_pad),
+            "bottom_left":  "x={p}:y=H-h-{p}".format(p=pip_pad),
+        }
+        ovl_pos = positions.get(pip_position, positions["bottom_right"])
+        # Scale + (optional) drawbox border. Rounded corners aren't worth
+        # the geq complexity; a 2-3px border looks cleaner anyway.
+        if pip_round:
+            # Add a thin dark border to separate the PiP from the source.
+            pip_chain = (
+                "scale={w}:-2,"
+                "drawbox=x=0:y=0:w=iw:h=ih:color=black@0.45:thickness=3"
+                .format(w=pip_w)
+            )
+        else:
+            pip_chain = "scale={w}:-2".format(w=pip_w)
+        prev_label = pre_logo_label  # whatever feeds into the logo step
+        # Reuse the existing pre_logo→[v] path: insert PiP overlay BEFORE
+        # the logo step. We rewire by changing the label that the logo step
+        # reads from.
+        new_pre_logo = "[v_pre_pip_then_logo]"
+        full_chain += (
+            ";[{idx}:v]{pc}[pip];"
+            "{prev}[pip]overlay={pos}:format=auto{nl}"
+        ).format(
+            idx=next_input_idx,
+            pc=pip_chain,
+            prev=prev_label,
+            pos=ovl_pos,
+            nl=new_pre_logo,
+        )
+        next_input_idx += 1
+        pre_logo_label = new_pre_logo
+
     # Logo overlay (always-on watermark in a corner). Drop logo.png in the
     # workdir and the assembler scales + positions it at `logo_position`.
     if logo_path:
@@ -836,6 +905,9 @@ def render_clip(
     #   3. fades at boundaries.
     #   4. (per-clip) loudnorm to social target.
     a_filter_parts = []
+    if do_reverse:
+        # Reverse audio so it matches the reversed video.
+        a_filter_parts.append("areverse")
     if audio_clean:
         # afftdn defaults are conservative; nr=12 is gentle, nf=-30 noise floor.
         a_filter_parts.append("afftdn=nr=12:nf=-30")
@@ -1071,6 +1143,17 @@ def main():
         if p.exists():
             logo_path = p
             break
+
+    # Picture-in-picture detection: webcam.mp4 / cam.mp4 / pip.mp4 in workdir.
+    pip_path = None
+    for name in ("webcam.mp4", "cam.mp4", "pip.mp4"):
+        p = workdir / name
+        if p.exists():
+            pip_path = p
+            break
+    pip_position = style.get("pip_position", "bottom_right")
+    pip_scale = float(style.get("pip_scale", 0.22))
+    pip_round = bool(style.get("pip_round", True))
     logo_position = style.get("logo_position", "top_right")
     logo_opacity = float(style.get("logo_opacity", 0.85))
     logo_scale = float(style.get("logo_scale", 0.10))
@@ -1184,6 +1267,10 @@ def main():
                 zoom_peaks=seg_zoom_peaks,
                 stabilize=bool(seg.get("stabilize", default_stabilize)),
                 quality=default_quality,
+                pip_path=pip_path,
+                pip_position=pip_position,
+                pip_scale=pip_scale,
+                pip_round=pip_round,
             )
             parts.append(part)
             # Effective duration after speed change (matters for xfade offsets).
@@ -1298,6 +1385,10 @@ def main():
             stabilize=bool(clip.get("stabilize", default_stabilize)),
             face_track=face_track,
             quality=default_quality,
+            pip_path=pip_path,
+            pip_position=pip_position,
+            pip_scale=pip_scale,
+            pip_round=pip_round,
         )
         print("clip → {}".format(clips_dir / name))
 
