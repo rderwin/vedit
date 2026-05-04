@@ -432,10 +432,20 @@ def caption_chunks_for(
                 mode="phrase", drop_fillers=drop_fillers,
                 max_chunks=max_chunks,
             )
-        # Ensure each word is on screen for at least min_dur.
-        for w in words:
-            if w["end"] - w["start"] < min_dur:
-                w["end"] = w["start"] + min_dur
+        # Cap each word's end at the next word's start so chunks never
+        # overlap. Critical for word_active — overlapping enable= windows
+        # render multiple sliding-window captions simultaneously, smearing
+        # text across the screen. Speech faster than min_dur (~1.4 wps)
+        # is the common case, so a global min_dur extension breaks the
+        # mode for fast talkers. Each word is visible exactly while
+        # spoken; a small 30ms readability floor keeps drumroll-fast
+        # syllables from flickering by too quickly.
+        readable_floor = 0.18
+        for i, w in enumerate(words):
+            next_start = (
+                words[i + 1]["start"] if i + 1 < len(words) else end - start
+            )
+            w["end"] = min(next_start, max(w["end"], w["start"] + readable_floor))
 
         if mode == "word":
             return words
