@@ -16,8 +16,9 @@
 # Idempotent — re-running is safe; each step skips if its output exists.
 #
 # Env vars:
-#   PICKER            'auto_edl' (default; peak-only heuristic) or 'claude'
-#                     (uses claude_pick.py — needs ANTHROPIC_API_KEY).
+#   PICKER            'auto_edl' (default; peak-only heuristic),
+#                     'claude'   (claude_pick.py — needs ANTHROPIC_API_KEY),
+#                     or 'local' (pick_local.py — uses local Ollama).
 #   WHISPERX          '1' to use transcribe_x.py instead of transcribe.sh.
 #                     Needs whisperx installed; see WHISPERX.md.
 #   FACE_TRACK        '1' to run smart_crop.py for vertical_fit=face_track.
@@ -119,6 +120,9 @@ if [ ! -f "$WORKDIR/auto_edl.json" ] && [ ! -f "$WORKDIR/edl.json" ]; then
       else
         uv run --quiet "$SCRIPT_DIR/claude_pick.py" "$WORKDIR"
       fi
+      ;;
+    local)
+      uv run --quiet "$SCRIPT_DIR/pick_local.py" "$WORKDIR"
       ;;
     auto_edl|*)
       python3 "$SCRIPT_DIR/auto_edl.py" "$WORKDIR"
