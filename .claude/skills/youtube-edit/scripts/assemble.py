@@ -562,6 +562,46 @@ def _is_emphasis(word):
     return False
 
 
+def shake_expressions(shakes, *, max_offset_frac=0.018, max_zoom=1.030):
+    """Build (zoom_term, x_term, y_term) ffmpeg expressions for camera shake.
+
+    Camera shake is implemented inside the existing `zoompan` filter — we
+    add a small base zoom (so there's crop headroom to translate within)
+    plus time-bounded sinusoidal x/y offsets in source-pixel fractions.
+
+    Each shake event is a {"t": clip_rel_sec, "dur": s, "intensity": 0..1}.
+    The envelope is a triangle (0 → 1 → 0) over [t, t+dur/2, t+dur] so the
+    shake fades in and out symmetrically. Different sin/cos frequencies on
+    x and y avoid a perfect circular wobble — feels handheld, not robotic.
+
+    Returned terms slot into:
+      zoom_term  → another summand inside the zoompan z= expression
+      x_term     → multiplier of iw, added to the zoompan x= expression
+      y_term     → multiplier of ih, added to the zoompan y= expression
+    Returns (None, None, None) if `shakes` is empty.
+    """
+    if not shakes:
+        return None, None, None
+    z_terms = []
+    x_terms = []
+    y_terms = []
+    for s in shakes:
+        t = float(s["t"])
+        intensity = max(0.0, min(1.0, float(s.get("intensity", 1.0))))
+        dur = max(0.05, float(s.get("dur", s.get("duration", 0.4))))
+        # Triangle envelope: 0 at t, 1 at t+dur/2, 0 at t+dur.
+        env = "max(0\\,1-2*abs(time-{:.3f})/{:.3f})".format(t + dur / 2, dur)
+        z_terms.append("{:.4f}*{}".format(intensity * (max_zoom - 1.0), env))
+        # sin(40t) / cos(53t) — coprime-ish frequencies for non-circular jitter.
+        x_terms.append(
+            "{:.4f}*sin(40*time)*{}".format(intensity * max_offset_frac, env)
+        )
+        y_terms.append(
+            "{:.4f}*cos(53*time)*{}".format(intensity * max_offset_frac, env)
+        )
+    return "+".join(z_terms), "+".join(x_terms), "+".join(y_terms)
+
+
 def punch_expression(punches, *, up_dur=0.10, default_hold=0.30,
                      down_dur=0.40, max_zoom=1.20):
     """Build a snap-zoom expression for ffmpeg's `zoompan` filter.
@@ -832,6 +872,8 @@ def render_clip(
     sfx_on_title=False,
     zoom_peaks=None,
     punches=None,
+    shake=None,
+    flashes=None,
     stabilize=False,
     face_track=None,
     quality="balanced",
@@ -940,17 +982,20 @@ def render_clip(
     else:
         full_chain = "[0:v]" + color_grade + "[base]"
 
-    # Auto-zoom on reaction peaks + explicit reaction-zoom punches. Both
-    # feed the same zoompan filter, combined via max() so concurrent
-    # peaks don't compound past their own ceiling. Inserts AFTER the base
+    # Auto-zoom + reaction-zoom punches + camera shake all feed the same
+    # zoompan filter. Zoom factors combine via max() so overlapping peaks
+    # don't compound past their own ceiling. Shake adds a small base zoom
+    # (for crop headroom) plus x/y pixel offsets. Inserts AFTER the base
     # video is composed but BEFORE captions/title/logo so we don't zoom
     # into the title bar. Times are clip-relative in source seconds; map
     # to output time when speed != 1.
-    if zoom_peaks or punches:
-        parts = []
+    if zoom_peaks or punches or shake:
+        # Map all event times through speed so they hit at the right
+        # OUTPUT time (zoompan's `time` is output seconds).
+        zoom_parts = []
         if zoom_peaks:
             peaks_out = [t / speed for t in zoom_peaks]
-            parts.append(zoom_expression(peaks_out))
+            zoom_parts.append(zoom_expression(peaks_out))
         if punches:
             punches_out = []
             for p in punches:
@@ -963,20 +1008,44 @@ def render_clip(
                 punches_out.append(p2)
             pexpr = punch_expression(punches_out)
             if pexpr:
-                parts.append(pexpr)
-        if len(parts) == 1:
-            zexpr = parts[0]
+                zoom_parts.append(pexpr)
+        shake_z = shake_x = shake_y = None
+        if shake:
+            shakes_out = []
+            for s in shake:
+                s2 = dict(s)
+                s2["t"] = float(s["t"]) / speed
+                if "dur" in s2:
+                    s2["dur"] = float(s2["dur"]) / speed
+                if "duration" in s2:
+                    s2["duration"] = float(s2["duration"]) / speed
+                shakes_out.append(s2)
+            shake_z, shake_x, shake_y = shake_expressions(shakes_out)
+            if shake_z:
+                zoom_parts.append("1+{}".format(shake_z))
+
+        # Reduce zoom_parts via max() into a single z= expression.
+        if len(zoom_parts) == 1:
+            zexpr = zoom_parts[0]
         else:
-            # max() of zoom factors — both expressions return values >= 1,
-            # so max() picks whichever is more zoomed at each frame.
-            zexpr = "max({}\\,{})".format(parts[0], parts[1])
-        # `d=1` keeps frame rate (one out per in). `s` is the canvas size.
-        full_chain = full_chain.replace(
-            "[base]",
-            ",zoompan=z='{z}':d=1:s={W}x{H}:fps=30[base]".format(
-                z=zexpr, W=out_w, H=out_h,
-            ),
-        )
+            zexpr = zoom_parts[0]
+            for p in zoom_parts[1:]:
+                zexpr = "max({}\\,{})".format(zexpr, p)
+
+        if shake_x:
+            # zoompan default x/y center the zoom; we add the shake delta.
+            # Source-pixel scale: multiply iw/ih by the fractional offset.
+            x_expr = "iw/2-(iw/zoom/2)+iw*({})".format(shake_x)
+            y_expr = "ih/2-(ih/zoom/2)+ih*({})".format(shake_y)
+            zoompan_str = (
+                ",zoompan=z='{z}':x='{x}':y='{y}':d=1:s={W}x{H}:fps=30[base]"
+            ).format(z=zexpr, x=x_expr, y=y_expr, W=out_w, H=out_h)
+        else:
+            # `d=1` keeps frame rate (one out per in). `s` is the canvas size.
+            zoompan_str = (
+                ",zoompan=z='{z}':d=1:s={W}x{H}:fps=30[base]"
+            ).format(z=zexpr, W=out_w, H=out_h)
+        full_chain = full_chain.replace("[base]", zoompan_str)
 
     inputs = ["-i", str(src)]
     overlays = ["[base]"]
@@ -1033,6 +1102,36 @@ def render_clip(
             )
             overlays.append(new_label)
             next_input_idx += 1
+
+    # Flashes — single-frame impact "pop" via a solid-color full-canvas
+    # overlay enabled for `dur` (default 50ms ≈ 1.5 frames). Generated
+    # entirely inside the filter graph via `color` source — no PNG asset
+    # required. Sit above cutaways but BELOW captions/title so they don't
+    # obscure readable text. Color names ("white", "black") and 0xRRGGBB
+    # both work; "#RRGGBB" gets rewritten to "0xRRGGBB" for ffmpeg.
+    if flashes:
+        for j, fl in enumerate(flashes):
+            color = str(fl.get("color", "white"))
+            if color.startswith("#"):
+                color = "0x" + color[1:]
+            intensity = max(0.0, min(1.0, float(fl.get("intensity", 1.0))))
+            t_in = float(fl.get("t", 0)) / speed
+            t_out = t_in + float(fl.get("dur", fl.get("duration", 0.05))) / speed
+            flash_label = "[fls{}]".format(j)
+            new_label = "[fl{}]".format(j)
+            full_chain += (
+                ";color=c={c}@{a:.3f}:s={W}x{H}:d={d:.3f}:r=30{flab};"
+                "{prev}{flab}overlay=0:0:format=auto:eof_action=pass:"
+                "enable='between(t,{a_t},{b_t})'{nl}"
+            ).format(
+                c=color, a=intensity, W=out_w, H=out_h, d=eff_dur,
+                flab=flash_label, prev=overlays[-1],
+                a_t=round(t_in, 3), b_t=round(t_out, 3),
+                nl=new_label,
+            )
+            overlays.append(new_label)
+            # Note: `color` is a source filter (no `-i`), so next_input_idx
+            # does NOT advance — we didn't add an `-i` input.
 
     # Caption overlays (captions list of {start,end,text} relative to clip).
     # Caption timestamps are in source seconds; the output's `t` coordinate
@@ -1727,6 +1826,8 @@ def main():
                 sfx_on_title=default_sfx_on_title,
                 zoom_peaks=seg_zoom_peaks,
                 punches=seg.get("punches"),
+                shake=seg.get("shake"),
+                flashes=seg.get("flashes"),
                 stabilize=bool(seg.get("stabilize", default_stabilize)),
                 quality=default_quality,
                 pip_path=pip_path,
@@ -1846,6 +1947,8 @@ def main():
             sfx_on_title=clip_sfx,
             zoom_peaks=clip_zoom_peaks,
             punches=clip.get("punches"),
+            shake=clip.get("shake"),
+            flashes=clip.get("flashes"),
             stabilize=bool(clip.get("stabilize", default_stabilize)),
             face_track=face_track,
             quality=default_quality,
@@ -1895,6 +1998,8 @@ def main():
                 sfx_on_title=clip_sfx,
                 zoom_peaks=clip_zoom_peaks,
                 punches=clip.get("punches"),
+                shake=clip.get("shake"),
+                flashes=clip.get("flashes"),
                 stabilize=bool(clip.get("stabilize", default_stabilize)),
                 face_track=face_track,
                 quality=default_quality,
@@ -1943,6 +2048,8 @@ def main():
                     sfx_on_title=clip_sfx,
                     zoom_peaks=clip_zoom_peaks,
                     punches=clip.get("punches"),
+                    shake=clip.get("shake"),
+                    flashes=clip.get("flashes"),
                     stabilize=bool(clip.get("stabilize", default_stabilize)),
                     face_track=face_track,
                     quality=default_quality,
