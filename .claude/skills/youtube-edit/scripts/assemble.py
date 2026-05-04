@@ -418,6 +418,7 @@ def caption_chunks_for(
                     "start": max(0.0, t0),
                     "end": min(end - start, t0 + wdur),
                     "text": w,
+                    "_emphasis": _is_emphasis(w),
                 })
         # Filter graph explodes on >max_chunks overlays; fall back gracefully.
         if len(words) > max_chunks:
@@ -458,6 +459,7 @@ def caption_chunks_for(
                 "text": " ".join(window),
                 "_words": window,
                 "_active_idx": active_idx,
+                "_emphasis": w.get("_emphasis", False),
             })
         return out
 
@@ -537,6 +539,71 @@ def peaks_inside_clip(signals, start, end, *, top_n=3, min_lufs=-25.0):
 
 def _is_filler(word):
     return word.lower().strip(".,!?;:") in {"um", "uh", "uhh", "uhm", "er"}
+
+
+def _is_emphasis(word):
+    """Detect punchline words for caption emphasis.
+
+    True when the word is ALLCAPS (>=3 letters, to skip acronyms like OK)
+    or ends with double punctuation `!!`, `??`, `?!`, `!?` — this is the
+    convention pickers use to mark intent-to-emphasize. The user can also
+    hand-edit transcript.json to flag specific moments.
+    """
+    if not word:
+        return False
+    bare = word.strip(".,;:'\"()[]{}<>")
+    if not bare:
+        return False
+    if bare.endswith(("!!", "??", "?!", "!?")):
+        return True
+    letters = [c for c in bare if c.isalpha()]
+    if len(letters) >= 3 and all(c.isupper() for c in letters):
+        return True
+    return False
+
+
+def punch_expression(punches, *, up_dur=0.10, default_hold=0.30,
+                     down_dur=0.40, max_zoom=1.20):
+    """Build a snap-zoom expression for ffmpeg's `zoompan` filter.
+
+    Sharper than `zoom_expression` — zoom snaps in over `up_dur`, holds at
+    peak, releases over `down_dur`. Used for explicit `clip.punches` (e.g.
+    a reaction shot you want to hit hard) where the smooth triangle
+    envelope of auto-zoom would feel too gentle.
+
+    `punches` is a list of {"t": clip_rel_sec, "intensity": 0..1, "dur": s}.
+    intensity 1.0 → full max_zoom (1.20×); 0.5 → halfway. dur sets how long
+    the hold lasts (default 0.30s); total visible time is up + hold + down.
+
+    Backslash-escaped commas keep the expression intact when it sits inside
+    a quoted ffmpeg filter argument.
+    """
+    if not punches:
+        return None
+    delta = max_zoom - 1.0
+    envs = []
+    for p in punches:
+        t = float(p["t"])
+        intensity = max(0.0, min(1.0, float(p.get("intensity", 1.0))))
+        if "dur" in p or "duration" in p:
+            hold = max(
+                0.0,
+                float(p.get("dur", p.get("duration"))) - up_dur - down_dur,
+            )
+        else:
+            hold = default_hold
+        # Asymmetric envelope:
+        #   ramp up: 0 → 1 over [t-up_dur, t]
+        #   hold:  1 over [t, t+hold]
+        #   ramp dn: 1 → 0 over [t+hold, t+hold+down_dur]
+        # env = max(0, min((time-t+up)/up, 1, 1-(time-t-hold)/down))
+        env = (
+            "max(0\\,min((time-{t:.3f}+{u:.3f})/{u:.3f}\\,"
+            "min(1\\,1-(time-{t:.3f}-{h:.3f})/{d:.3f})))"
+        ).format(t=t, u=up_dur, h=hold, d=down_dur)
+        envs.append("{:.4f}*{}".format(delta * intensity, env))
+    summed = "+".join(envs)
+    return "1+min(1\\,{})".format(summed)
 
 
 def export_audio(src_mp4, out_path, quality="balanced"):
@@ -764,6 +831,7 @@ def render_clip(
     audio_clean=False,
     sfx_on_title=False,
     zoom_peaks=None,
+    punches=None,
     stabilize=False,
     face_track=None,
     quality="balanced",
@@ -872,13 +940,36 @@ def render_clip(
     else:
         full_chain = "[0:v]" + color_grade + "[base]"
 
-    # Auto-zoom on reaction peaks. Inserts a time-varying zoompan AFTER
-    # the base video is composed but BEFORE captions/title/logo so we
-    # don't zoom into the title bar. zoom_peaks are clip-relative times
-    # in source seconds; map to output time when speed != 1.
-    if zoom_peaks:
-        peaks_out = [t / speed for t in zoom_peaks]
-        zexpr = zoom_expression(peaks_out)
+    # Auto-zoom on reaction peaks + explicit reaction-zoom punches. Both
+    # feed the same zoompan filter, combined via max() so concurrent
+    # peaks don't compound past their own ceiling. Inserts AFTER the base
+    # video is composed but BEFORE captions/title/logo so we don't zoom
+    # into the title bar. Times are clip-relative in source seconds; map
+    # to output time when speed != 1.
+    if zoom_peaks or punches:
+        parts = []
+        if zoom_peaks:
+            peaks_out = [t / speed for t in zoom_peaks]
+            parts.append(zoom_expression(peaks_out))
+        if punches:
+            punches_out = []
+            for p in punches:
+                p2 = dict(p)
+                p2["t"] = float(p["t"]) / speed
+                if "dur" in p2:
+                    p2["dur"] = float(p2["dur"]) / speed
+                if "duration" in p2:
+                    p2["duration"] = float(p2["duration"]) / speed
+                punches_out.append(p2)
+            pexpr = punch_expression(punches_out)
+            if pexpr:
+                parts.append(pexpr)
+        if len(parts) == 1:
+            zexpr = parts[0]
+        else:
+            # max() of zoom factors — both expressions return values >= 1,
+            # so max() picks whichever is more zoomed at each frame.
+            zexpr = "max({}\\,{})".format(parts[0], parts[1])
         # `d=1` keeps frame rate (one out per in). `s` is the canvas size.
         full_chain = full_chain.replace(
             "[base]",
@@ -951,15 +1042,18 @@ def render_clip(
             cap_png = work_assets / "cap_{}.png".format(i)
             # word_active mode: chunk has `_words` + `_active_idx` for the
             # karaoke-style active-highlight renderer.
+            emph = bool(c.get("_emphasis", False))
             if "_words" in c:
                 img = render_caption_active(
                     c["_words"], c["_active_idx"], out_w, out_h,
                     style=caption_style, accent=accent,
+                    emphasis=emph,
                 )
             else:
                 img = render_caption(
                     c["text"], out_w, out_h,
                     style=caption_style, accent=accent,
+                    emphasis=emph,
                 )
             img.save(cap_png)
             inputs += png_input_prefix + ["-i", str(cap_png)]
@@ -1632,6 +1726,7 @@ def main():
                 audio_clean=default_audio_clean,
                 sfx_on_title=default_sfx_on_title,
                 zoom_peaks=seg_zoom_peaks,
+                punches=seg.get("punches"),
                 stabilize=bool(seg.get("stabilize", default_stabilize)),
                 quality=default_quality,
                 pip_path=pip_path,
@@ -1750,6 +1845,7 @@ def main():
             audio_clean=clip_audio_clean,
             sfx_on_title=clip_sfx,
             zoom_peaks=clip_zoom_peaks,
+            punches=clip.get("punches"),
             stabilize=bool(clip.get("stabilize", default_stabilize)),
             face_track=face_track,
             quality=default_quality,
@@ -1798,6 +1894,7 @@ def main():
                 audio_clean=clip_audio_clean,
                 sfx_on_title=clip_sfx,
                 zoom_peaks=clip_zoom_peaks,
+                punches=clip.get("punches"),
                 stabilize=bool(clip.get("stabilize", default_stabilize)),
                 face_track=face_track,
                 quality=default_quality,
@@ -1845,6 +1942,7 @@ def main():
                     audio_clean=clip_audio_clean,
                     sfx_on_title=clip_sfx,
                     zoom_peaks=clip_zoom_peaks,
+                    punches=clip.get("punches"),
                     stabilize=bool(clip.get("stabilize", default_stabilize)),
                     face_track=face_track,
                     quality=default_quality,

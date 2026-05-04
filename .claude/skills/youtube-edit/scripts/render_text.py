@@ -262,7 +262,8 @@ def render_overlay_text(text, width, height, *,
 
 
 def render_caption_active(words, active_idx, width, height,
-                          style="minimal", accent="#FFD24A"):
+                          style="minimal", accent="#FFD24A",
+                          emphasis=False):
     """Karaoke-style caption — show all `words` on one line, with
     `words[active_idx]` highlighted.
 
@@ -272,6 +273,10 @@ def render_caption_active(words, active_idx, width, height,
 
     Each word renders at the same size; the active word gets a colored
     pill (or a stroke for `minimal` style). Centered horizontally.
+
+    `emphasis=True` bumps the active word ~25% larger and tints it the
+    accent color — used for ALLCAPS / `!!` / `??` punchline words detected
+    by `_is_emphasis` in assemble.py.
     """
     img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
@@ -287,16 +292,30 @@ def render_caption_active(words, active_idx, width, height,
     font = _font(font_size)
     space = max(8, int(font_size * 0.22))
 
-    # Measure each word so we can lay them out and shrink-fit if needed.
-    widths = [draw.textlength(w.upper(), font=font) for w in words]
+    # Emphasis font: ~25% bigger, only applied to active word (and only when
+    # the chunk is flagged emphasis). Non-active words stay at base size.
+    emph_font_size = int(font_size * 1.25) if emphasis else font_size
+    emph_font = _font(emph_font_size) if emphasis else font
+
+    def _word_widths():
+        out = []
+        for i, w in enumerate(words):
+            f = emph_font if (emphasis and i == active_idx) else font
+            out.append(draw.textlength(w.upper(), font=f))
+        return out
+
+    widths = _word_widths()
     max_text_w = int(width * 0.92)
 
     # If the words are too wide, drop down a font tier and remeasure.
+    # Shrink both fonts together so emphasis ratio stays consistent.
     while sum(widths) + space * (len(words) - 1) > max_text_w and font_size > 30:
         font_size -= 4
         font = _font(font_size)
+        emph_font_size = int(font_size * 1.25) if emphasis else font_size
+        emph_font = _font(emph_font_size) if emphasis else font
         space = max(6, int(font_size * 0.22))
-        widths = [draw.textlength(w.upper(), font=font) for w in words]
+        widths = _word_widths()
 
     total_w = sum(widths) + space * (len(words) - 1)
     x = (width - total_w) // 2
@@ -322,44 +341,68 @@ def render_caption_active(words, active_idx, width, height,
     radius = int(font_size * 0.28)
     stroke_w = max(3, int(font_size * 0.075))
 
+    accent_rgba = _hex_rgba(accent)
+
     cur_x = x
     for i, w in enumerate(words):
         word_text = w.upper()
         word_w = widths[i]
         is_active = (i == active_idx)
-        if is_active and active_bg is not None:
+        is_emph = bool(emphasis) and is_active
+        f = emph_font if is_emph else font
+        # Emphasis word: bigger + accent-colored. Vertically center against
+        # the base line so emphasis sticks above/below the row symmetrically.
+        if is_emph:
+            y_offset = (font_size - emph_font_size) // 2
+        else:
+            y_offset = 0
+        word_y = y + y_offset
+        word_h = emph_font_size if is_emph else font_size
+        if is_active and active_bg is not None and not is_emph:
             x1 = cur_x - pad_x
-            y1 = y - pad_y
+            y1 = word_y - pad_y
             x2 = cur_x + word_w + pad_x
-            y2 = y + font_size + pad_y
+            y2 = word_y + word_h + pad_y
             try:
                 draw.rounded_rectangle((x1, y1, x2, y2),
                                        radius=radius, fill=active_bg)
             except Exception:
                 draw.rectangle((x1, y1, x2, y2), fill=active_bg)
-            draw.text((cur_x, y), word_text, fill=active_fg, font=font)
+            draw.text((cur_x, word_y), word_text, fill=active_fg, font=f)
+        elif is_emph:
+            # Emphasis: skip pill; render in accent color with a bold stroke
+            # so it pops against any background. Always uses the stroke
+            # treatment regardless of `style` — emphasis is its own thing.
+            estroke = max(4, int(emph_font_size * 0.085))
+            draw.text((cur_x, word_y), word_text,
+                      fill=accent_rgba, font=f,
+                      stroke_width=estroke, stroke_fill=(0, 0, 0, 255))
         elif is_active and style == "minimal":
             # Active word gets the stroke, context words are plain
-            draw.text((cur_x, y), word_text, fill=active_fg, font=font,
+            draw.text((cur_x, word_y), word_text, fill=active_fg, font=f,
                       stroke_width=stroke_w, stroke_fill=(0, 0, 0, 255))
         else:
             # Context word — softer alpha, optional thin shadow
             if style == "minimal":
-                draw.text((cur_x + 2, y + 2), word_text,
-                          fill=(0, 0, 0, 160), font=font)
-            draw.text((cur_x, y), word_text, fill=ctx_fg, font=font)
+                draw.text((cur_x + 2, word_y + 2), word_text,
+                          fill=(0, 0, 0, 160), font=f)
+            draw.text((cur_x, word_y), word_text, fill=ctx_fg, font=f)
         cur_x += word_w + space
 
     return img
 
 
-def render_caption(text, width, height, style="minimal", accent="#FFD24A"):
+def render_caption(text, width, height, style="minimal", accent="#FFD24A",
+                   emphasis=False):
     """Centered, big, bold short-form caption (TikTok / Reels style).
 
     Styles:
       minimal — white text + thick black stroke (current default).
       bold    — white text on a black rounded pill (no stroke).
       pop     — black text on an accent-colored pill (MrBeast-adjacent).
+
+    `emphasis=True` overrides the style — render bigger and in the accent
+    color regardless. Used for punchline words flagged by `_is_emphasis`.
     """
     img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
@@ -372,6 +415,9 @@ def render_caption(text, width, height, style="minimal", accent="#FFD24A"):
         font_size = max(40, int(height * 0.070))
         center_y_frac = 0.78
 
+    if emphasis:
+        font_size = int(font_size * 1.25)
+
     font = _font(font_size)
     max_text_w = int(width * 0.85)
     lines = _wrap(text.upper(), font, max_text_w, draw)
@@ -379,8 +425,9 @@ def render_caption(text, width, height, style="minimal", accent="#FFD24A"):
     block_h = line_h * len(lines)
     y0 = int(height * center_y_frac) - block_h // 2
 
-    if style == "minimal":
+    if style == "minimal" or emphasis:
         stroke_w = max(4, int(font_size * 0.085))
+        fg = _hex_rgba(accent) if emphasis else (255, 255, 255, 255)
         for i, line in enumerate(lines):
             line_w = draw.textlength(line, font=font)
             x = (width - line_w) // 2
@@ -388,7 +435,7 @@ def render_caption(text, width, height, style="minimal", accent="#FFD24A"):
             draw.text(
                 (x, y),
                 line,
-                fill=(255, 255, 255, 255),
+                fill=fg,
                 font=font,
                 stroke_width=stroke_w,
                 stroke_fill=(0, 0, 0, 255),
