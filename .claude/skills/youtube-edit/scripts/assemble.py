@@ -776,11 +776,34 @@ def render_clip(
     sfx_dir=None,
     text_overlays=None,
     cutaways=None,
+    freezes=None,
 ):
     """Render one polished clip. Returns the output path."""
     dur = end - start
     if dur <= 0:
         raise ValueError("non-positive duration: {} → {}".format(start, end))
+
+    # Freezes are conceptually a self-cutaway — pause video on a frame
+    # while audio continues. We extract the frame at t and push it onto
+    # the cutaways list, reusing the cutaway compositing path entirely.
+    if freezes:
+        cutaways = list(cutaways or [])
+        for j, fr in enumerate(freezes):
+            t_clip = float(fr.get("t", 0))
+            t_dur = float(fr.get("dur", fr.get("duration", 0.5)))
+            t_src = start + t_clip
+            frame_png = (work_assets or pathlib.Path(".")) / "freeze_{}.png".format(j)
+            (work_assets or pathlib.Path(".")).mkdir(parents=True, exist_ok=True)
+            subprocess.run([
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-ss", "{:.3f}".format(t_src),
+                "-i", str(src),
+                "-frames:v", "1",
+                str(frame_png),
+            ], check=True)
+            cutaways.append({
+                "t": t_clip, "dur": t_dur, "src": str(frame_png.resolve()),
+            })
     # Effective duration (post-speed). Used for PNG bounds, audio fades,
     # PiP trim, and the reverse-filter memory warning. abs() for negative
     # speed (reverse).
@@ -1738,6 +1761,7 @@ def main():
             sfx_dir=workdir / "sfx",
             text_overlays=clip.get("overlays"),
             cutaways=clip.get("cutaways"),
+            freezes=clip.get("freezes"),
         )
         print("clip → {}".format(clips_dir / name))
 
@@ -1781,6 +1805,7 @@ def main():
                 sfx_dir=workdir / "sfx",
                 text_overlays=clip.get("overlays"),
                 cutaways=clip.get("cutaways"),
+                freezes=clip.get("freezes"),
             )
             print("clip → {}".format(vert_dir / name))
 
