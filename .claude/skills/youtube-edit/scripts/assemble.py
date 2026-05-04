@@ -210,7 +210,40 @@ VERT_FITS = {
     # face_track is handled separately — needs the per-clip face_track
     # samples to build a time-varying crop expression. See build_face_track_filter.
     "face_track": "FACE_TRACK_PLACEHOLDER",
+    # auto picks blur_fill / fill_height / face_track per-source — see
+    # pick_auto_vertical_fit.
+    "auto": "AUTO_PLACEHOLDER",
 }
+
+
+def pick_auto_vertical_fit(face_track, src_dims):
+    """Heuristic for `vertical_fit: 'auto'`. Order:
+
+    1. If a face_track is loaded AND ≥40% of samples are non-center AND
+       the typical face spread is wide enough that the speaker actually
+       moves, prefer face_track.
+    2. Otherwise, if the source is wider than 16:9 (i.e. probably a
+       desktop / screen recording with a sidebar), prefer fill_height.
+    3. Otherwise, blur_fill (safest default for talking-head video).
+    """
+    src_w, src_h = src_dims
+    if face_track:
+        samples = face_track.get("samples") or []
+        if samples:
+            center = src_w / 2
+            non_center = sum(
+                1 for s in samples if abs(int(s["x"]) - center) > 60
+            )
+            if non_center / len(samples) >= 0.40:
+                xs = [int(s["x"]) for s in samples]
+                spread = max(xs) - min(xs)
+                # Spread > ~12% of width → speaker actually moves around
+                if spread >= src_w * 0.12:
+                    return "face_track"
+    # No reliable face — base on aspect ratio.
+    if src_w / max(src_h, 1) > 1.85:
+        return "fill_height"
+    return "blur_fill"
 
 
 def build_face_track_filter(track, clip_start, clip_end, src_w, src_h):
@@ -739,6 +772,13 @@ def render_clip(
             1.0 / speed
         )
     if vertical:
+        # Resolve `auto` → blur_fill | fill_height | face_track using the
+        # heuristic in pick_auto_vertical_fit.
+        if vertical_fit == "auto":
+            chosen = pick_auto_vertical_fit(face_track, src_dims)
+            print("[auto vertical_fit] picked '{}'".format(chosen))
+            vertical_fit = chosen
+
         if vertical_fit == "face_track" and face_track is not None:
             fit_filter = build_face_track_filter(
                 face_track, start, end,
