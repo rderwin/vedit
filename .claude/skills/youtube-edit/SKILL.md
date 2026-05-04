@@ -248,8 +248,10 @@ Outputs in `<workdir>/out/`: `main.mp4`, `clips/NN_slug.mp4`, `clips_vertical/NN
 
 - `vertical_fit`, `caption_style`, `caption_mode`, `title_anim`, `look`, `accent`, `audio_clean`, `sfx_on_title`
 - `transition` (per main segment) — xfade INTO this segment.
-- `speed` (per segment or clip) — `0.5` for slow-mo, `2.0` for fast-fwd. Caption timestamps and PNG durations adjust automatically.
+- `speed` (per segment or clip) — `0.5` for slow-mo, `2.0` for fast-fwd. `-1` reverses. Caption timestamps and PNG durations adjust automatically.
 - `captions: true|false` per clip. Default on for vertical, off for landscape.
+- `stings: [{t, name, volume?}]` — comedy sound stings mixed at clip-relative `t` seconds. Built-in `name`s: `boom`, `airhorn`, `riser`, `pop`, `ding`, `trombone`. Drop a wav at `<workdir>/sfx/<name>.wav` to override or add new ones (e.g. a real vine-boom mp3).
+- `overlays: [{t, dur, text, position?, style?, accent?, font_scale?}]` — free-form text overlays at clip-relative `t`. `position` is one of `top_left`, `top_center`, `top_right`, `mid_left`, `center`, `mid_right`, `bot_left`, `bot_center`, `bot_right`. `style` is `comment` (narrator-voice default — soft white with shadow), `pop` (accent pill), `bold` (dark pill), or `minimal` (white with stroke). Use ASCII glyphs (`<--`, `=>`) rather than `←` `→` — the bundled fonts don't include arrow chars.
 
 ---
 

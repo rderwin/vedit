@@ -164,6 +164,103 @@ def render_end_card(title, subtitle, cta, width, height, accent="#FFD24A"):
     return img
 
 
+def render_overlay_text(text, width, height, *,
+                        position="center",
+                        style="comment",
+                        accent="#FFD24A",
+                        font_scale=1.0):
+    """Render a free-form text overlay at one of 9 named positions.
+
+    Different from render_caption / render_caption_active in two ways:
+      - Lays out at an explicit position (corners + edges + center) rather
+        than always centered horizontally.
+      - Supports a 'comment' style (italic-feeling, lighter weight,
+        muted color) for narrator-voice text overlays — `← this guy`,
+        `(he was lying)`, `[uncomfortable silence]` — distinct from the
+        karaoke caption track they sit on top of.
+
+    Returns a transparent RGBA image. Caller composites via ffmpeg
+    overlay.
+
+    `position` is one of:
+      top_left  | top_center  | top_right
+      mid_left  | center      | mid_right
+      bot_left  | bot_center  | bot_right
+    """
+    img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    base = min(width, height)
+
+    if style == "pop":
+        font_size = max(36, int(base * 0.060 * font_scale))
+        bg = _hex_rgba(accent)[:3] + (235,)
+        fg = (16, 16, 18, 255)
+    elif style == "bold":
+        font_size = max(36, int(base * 0.058 * font_scale))
+        bg = (16, 16, 18, 220)
+        fg = (255, 255, 255, 255)
+    elif style == "minimal":
+        font_size = max(36, int(base * 0.060 * font_scale))
+        bg = None
+        fg = (255, 255, 255, 255)
+    else:  # 'comment' — narrator-voice default
+        font_size = max(28, int(base * 0.044 * font_scale))
+        bg = None
+        fg = (235, 235, 240, 235)
+
+    font = _font(font_size)
+    side_pad = int(width * 0.05)
+    edge_pad_v = int(height * 0.06)
+
+    # Wrap.
+    lines = _wrap(text, font, width - 2 * side_pad - 40, draw)
+    line_h = int(font_size * 1.15)
+    block_h = line_h * len(lines)
+
+    # Pick anchor.
+    if position.startswith("top"):
+        y = edge_pad_v
+    elif position.startswith("mid") or position == "center":
+        y = (height - block_h) // 2
+    else:  # bot
+        y = height - edge_pad_v - block_h
+
+    # Pill background or stroke per style.
+    pad_x = int(font_size * 0.45)
+    pad_y = int(font_size * 0.18)
+    radius = int(font_size * 0.30)
+    stroke_w = max(2, int(font_size * 0.06))
+
+    for i, line in enumerate(lines):
+        line_w = draw.textlength(line, font=font)
+        # X anchor per position.
+        if position.endswith("_left"):
+            x = side_pad
+        elif position.endswith("_right"):
+            x = width - side_pad - line_w
+        else:
+            x = (width - line_w) // 2
+        line_y = y + i * line_h
+
+        if bg is not None:
+            x1, y1 = x - pad_x, line_y - pad_y
+            x2, y2 = x + line_w + pad_x, line_y + font_size + pad_y
+            try:
+                draw.rounded_rectangle((x1, y1, x2, y2),
+                                       radius=radius, fill=bg)
+            except Exception:
+                draw.rectangle((x1, y1, x2, y2), fill=bg)
+            draw.text((x, line_y), line, fill=fg, font=font)
+        elif style == "minimal":
+            draw.text((x, line_y), line, fill=fg, font=font,
+                      stroke_width=stroke_w, stroke_fill=(0, 0, 0, 255))
+        else:  # comment — soft drop shadow
+            draw.text((x + 2, line_y + 2), line, fill=(0, 0, 0, 180), font=font)
+            draw.text((x, line_y), line, fill=fg, font=font)
+
+    return img
+
+
 def render_caption_active(words, active_idx, width, height,
                           style="minimal", accent="#FFD24A"):
     """Karaoke-style caption — show all `words` on one line, with

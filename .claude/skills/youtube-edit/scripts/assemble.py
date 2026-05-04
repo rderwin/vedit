@@ -53,6 +53,7 @@ from render_text import (
     render_caption,
     render_caption_active,
     render_end_card,
+    render_overlay_text,
 )
 
 
@@ -186,6 +187,41 @@ PRESETS = {
 }
 
 MUSIC_NAMES = ("music.mp3", "music.m4a", "music.wav", "music.ogg")
+
+# Synthesized comedy stings — short, punchy audio events to mix in at
+# specific timestamps. Each value is an ffmpeg lavfi `-i` argument that
+# generates the sound; the assembler delays each instance to its `t` and
+# amix-es them into the voice. User-supplied wavs at <workdir>/sfx/<name>.wav
+# override these — drop in a real vine-boom mp3 if the synthesized version
+# isn't punchy enough.
+STING_LAVFI = {
+    # Bass thump — synthesized vine-boom. Low sine with sharp attack + decay.
+    "boom":
+        "aevalsrc='0.85*sin(2*PI*55*t)*exp(-t*4)':duration=0.6:sample_rate=44100",
+    # Airhorn — rising tone with vibrato.
+    "airhorn":
+        "aevalsrc='0.55*sin(2*PI*(900+200*sin(2*PI*7*t))*t)*"
+        "if(lt(t\\,0.05)\\,t/0.05\\,if(gt(t\\,0.55)\\,(0.6-t)/0.05\\,1))':"
+        "duration=0.6:sample_rate=44100",
+    # Riser — pitch sweep low to high; build-up before a reveal.
+    "riser":
+        "aevalsrc='0.5*sin(2*PI*(120+1500*t/1.0)*t)*"
+        "if(gt(t\\,0.9)\\,(1.0-t)/0.1\\,t/0.4*(t<0.4)+(t>=0.4))':"
+        "duration=1.0:sample_rate=44100",
+    # Pop — bright cartoon click.
+    "pop":
+        "aevalsrc='0.7*sin(2*PI*1500*t)*exp(-t*30)':"
+        "duration=0.15:sample_rate=44100",
+    # Ding — bell tone.
+    "ding":
+        "aevalsrc='0.6*sin(2*PI*1200*t)*exp(-t*3)':"
+        "duration=0.8:sample_rate=44100",
+    # Sad trombone — pitch falls, womp-womp-womp.
+    "trombone":
+        "aevalsrc='0.5*sin(2*PI*220*pow(0.6\\,t)*t)*"
+        "if(gt(t\\,1.0)\\,(1.1-t)/0.1\\,1)':"
+        "duration=1.1:sample_rate=44100",
+}
 
 VERT_BLUR_FILL = (
     "split=2[bgsrc][fgsrc];"
@@ -736,6 +772,9 @@ def render_clip(
     pip_scale=0.22,
     pip_offset=24,
     pip_round=True,
+    stings=None,
+    sfx_dir=None,
+    text_overlays=None,
 ):
     """Render one polished clip. Returns the output path."""
     dur = end - start
@@ -871,6 +910,40 @@ def render_clip(
                 b=round(c["end"] / speed, 3),
                 nl=new_label,
             )
+            next_input_idx += 1
+
+    # Free-form text overlays — `clip.overlays: [{t, dur, text, position, style}]`.
+    # Sit between captions and the title bar (under the title, over the
+    # base video + captions). Each overlay is its own PNG input.
+    if text_overlays:
+        for j, ov in enumerate(text_overlays):
+            ov_text = ov.get("text", "")
+            if not ov_text:
+                continue
+            ov_png = work_assets / "overlay_{}.png".format(j)
+            img = render_overlay_text(
+                ov_text, out_w, out_h,
+                position=ov.get("position", "center"),
+                style=ov.get("style", "comment"),
+                accent=ov.get("accent", accent),
+                font_scale=float(ov.get("font_scale", 1.0)),
+            )
+            img.save(ov_png)
+            inputs += png_input_prefix + ["-i", str(ov_png)]
+            t_in = float(ov.get("t", 0)) / speed
+            t_out = t_in + float(ov.get("dur", ov.get("duration", 2.5))) / speed
+            new_label = "[ov{}]".format(j)
+            full_chain += (
+                ";{prev}[{idx}:v]overlay=0:0:format=auto:"
+                "enable='between(t,{a},{b})'{nl}"
+            ).format(
+                prev=overlays[-1],
+                idx=next_input_idx,
+                a=round(t_in, 3),
+                b=round(t_out, 3),
+                nl=new_label,
+            )
+            overlays.append(new_label)
             next_input_idx += 1
 
     # Title overlay. Always uses an alpha fade; `title_anim="slide"` adds a
@@ -1014,25 +1087,65 @@ def render_clip(
         a_filter_parts.append(LOUDNORM_CLIP)
     a_voice_chain = ",".join(a_filter_parts)
 
-    # Optional whoosh SFX synced to the title-in. We synthesize a quick
-    # tone via lavfi as an *appended* input (so the existing PNG indices
-    # stay stable), then mix it into the voice audio at t=0.
+    # Optional comedy stings — list of {t, name} to mix in at specific
+    # times. `sfx_on_title` is rolled into this list with name="title_pulse"
+    # at t=0.
+    sting_events = list(stings or [])
     if sfx_on_title and title:
-        sfx_idx = next_input_idx
-        # 0.35s sine "thump" — short and unobtrusive; landed sounds rather
-        # than sustained tones work better as title accents.
-        inputs += [
-            "-f", "lavfi",
-            "-t", "0.4",
-            "-i", "sine=frequency=200:duration=0.4:sample_rate=44100",
-        ]
-        next_input_idx += 1
-        full_chain += (
-            ";[0:a]{voice}[v_aud];"
-            "[{sfx}:a]volume=0.45,"
-            "afade=t=in:st=0:d=0.02,afade=t=out:st=0.22:d=0.18[sfx];"
-            "[v_aud][sfx]amix=inputs=2:duration=first:weights=1.0 1.0[a]"
-        ).format(voice=a_voice_chain, sfx=sfx_idx)
+        sting_events.insert(0, {"t": 0, "name": "title_pulse"})
+
+    if sting_events:
+        # Each sting becomes its own audio input, delayed to its t, then
+        # amix-ed with the voice chain.
+        sting_input_indices = []
+        for sting in sting_events:
+            name = sting.get("name", "boom")
+            user_wav = sfx_dir / "{}.wav".format(name) if sfx_dir else None
+            if user_wav and user_wav.exists():
+                inputs += ["-i", str(user_wav)]
+            elif name == "title_pulse":
+                # Backward-compat with the old sfx_on_title sound.
+                inputs += [
+                    "-f", "lavfi", "-t", "0.4",
+                    "-i", "sine=frequency=200:duration=0.4:sample_rate=44100",
+                ]
+            elif name in STING_LAVFI:
+                inputs += [
+                    "-f", "lavfi", "-t", "1.2",
+                    "-i", STING_LAVFI[name],
+                ]
+            else:
+                print("[stings] unknown sting '{}' — skipping. "
+                      "Built-in: {}, or drop a wav at sfx/{}.wav".format(
+                          name, ", ".join(sorted(STING_LAVFI)), name,
+                      ))
+                continue
+            sting_input_indices.append(
+                (next_input_idx, float(sting["t"]),
+                 float(sting.get("volume", 0.55)))
+            )
+            next_input_idx += 1
+
+        if sting_input_indices:
+            # Build per-sting filter chains.
+            full_chain += ";[0:a]{}[v_aud]".format(a_voice_chain)
+            sting_labels = []
+            for j, (idx, t, vol) in enumerate(sting_input_indices):
+                ms = max(0, int(round(t * 1000)))
+                # Adjust for output-time when speed != 1.
+                ms = int(ms / speed)
+                full_chain += (
+                    ";[{idx}:a]aformat=channel_layouts=mono,"
+                    "adelay={ms}|{ms},volume={v}[sting_{j}]"
+                ).format(idx=idx, ms=ms, v=vol, j=j)
+                sting_labels.append("[sting_{}]".format(j))
+            mix_in = "[v_aud]" + "".join(sting_labels)
+            full_chain += (
+                ";{m}amix=inputs={n}:duration=first:"
+                "normalize=0[a]"
+            ).format(m=mix_in, n=1 + len(sting_labels))
+        else:
+            full_chain += ";[0:a]{}[a]".format(a_voice_chain)
     else:
         full_chain += ";[0:a]{}[a]".format(a_voice_chain)
 
@@ -1578,6 +1691,9 @@ def main():
             pip_position=pip_position,
             pip_scale=pip_scale,
             pip_round=pip_round,
+            stings=clip.get("stings"),
+            sfx_dir=workdir / "sfx",
+            text_overlays=clip.get("overlays"),
         )
         print("clip → {}".format(clips_dir / name))
 
@@ -1617,6 +1733,9 @@ def main():
                 stabilize=bool(clip.get("stabilize", default_stabilize)),
                 face_track=face_track,
                 quality=default_quality,
+                stings=clip.get("stings"),
+                sfx_dir=workdir / "sfx",
+                text_overlays=clip.get("overlays"),
             )
             print("clip → {}".format(vert_dir / name))
 
