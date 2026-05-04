@@ -1261,6 +1261,21 @@ def main():
     show_speaker_labels = bool(style.get("show_speaker_labels", False))
     # Optional speaker map: {"SPEAKER_00": "ALICE", "SPEAKER_01": "BOB"}
     speaker_map = style.get("speaker_map") or {}
+    # Translation: render additional vertical clips with translated captions.
+    # Requires translate.py to have produced transcript.<lang>.json first.
+    translate_to = style.get("translate_to") or []
+    if isinstance(translate_to, str):
+        translate_to = [translate_to]
+    translated_transcripts = {}
+    for lang in translate_to:
+        tpath = workdir / "transcript.{}.json".format(lang)
+        if not tpath.exists():
+            print(
+                "[translate_to] missing {} — run scripts/translate.py first. "
+                "Skipping this language.".format(tpath.name)
+            )
+            continue
+        translated_transcripts[lang] = json.loads(tpath.read_text())
     if show_speaker_labels and speaker_map and transcript:
         # Apply rename in-place on the loaded transcript so all downstream
         # caption-chunk calls see the friendly names.
@@ -1604,6 +1619,48 @@ def main():
                 quality=default_quality,
             )
             print("clip → {}".format(vert_dir / name))
+
+            # Translation fan-out: render additional vertical copies with
+            # translated captions, one per target language. Audio is the
+            # original (no dubbing); only captions change.
+            for lang, lang_transcript in translated_transcripts.items():
+                if not do_caps:
+                    continue
+                lang_caps = caption_chunks_for(
+                    lang_transcript, start, end,
+                    mode=cap_mode, drop_fillers=drop_fillers,
+                    show_speaker_labels=show_speaker_labels,
+                )
+                lang_vert_dir = out_dir / "clips_vertical_{}".format(lang)
+                lang_vert_dir.mkdir(parents=True, exist_ok=True)
+                lang_assets = tmp_dir / "clip_{:02d}_v_{}".format(i, lang)
+                lang_assets.mkdir(exist_ok=True)
+                render_clip(
+                    src, start, end, lang_vert_dir / name,
+                    vertical=True,
+                    title=title,
+                    captions=lang_caps,
+                    src_dims=src_dims,
+                    work_assets=lang_assets,
+                    vertical_fit=v_fit,
+                    caption_style=cap_style,
+                    title_anim=t_anim,
+                    accent=accent,
+                    look=look,
+                    logo_path=logo_path,
+                    logo_position=logo_position,
+                    logo_opacity=logo_opacity,
+                    logo_scale=logo_scale,
+                    lut_path=lut_path,
+                    speed=clip_speed,
+                    audio_clean=clip_audio_clean,
+                    sfx_on_title=clip_sfx,
+                    zoom_peaks=clip_zoom_peaks,
+                    stabilize=bool(clip.get("stabilize", default_stabilize)),
+                    face_track=face_track,
+                    quality=default_quality,
+                )
+                print("clip → {} ({})".format(lang_vert_dir / name, lang))
 
     shutil.rmtree(tmp_dir, ignore_errors=True)
     print("\ndone. output in {}".format(out_dir))
