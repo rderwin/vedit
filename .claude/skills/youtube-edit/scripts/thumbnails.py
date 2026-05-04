@@ -180,14 +180,62 @@ def render_thumbnail(src_frame_png, headline, subhead, w, h, accent="#FFD24A"):
     return img
 
 
+def auto_spec_from_edl(workdir):
+    """Build a thumbnails spec from edl.json's clips — one thumbnail per
+    clip, headline = clip title, t = midpoint of the clip range.
+
+    For users who don't want to hand-write thumbnails.json: the EDL
+    already names the best moments and gives them titles. Each clip
+    becomes a thumbnail candidate at its mid-point (where the
+    punchline / reaction usually lands).
+    """
+    edl_path = workdir / "edl.json"
+    if not edl_path.exists():
+        sys.exit("--from-edl: no edl.json in " + str(workdir))
+    edl = json.loads(edl_path.read_text())
+    clips = edl.get("clips") or []
+    if not clips:
+        sys.exit("--from-edl: edl.json has no clips")
+
+    return {
+        "source": edl.get("source", "source.mp4"),
+        "format": "youtube",
+        "accent": (edl.get("style") or {}).get("accent", "#FFD24A"),
+        "thumbnails": [
+            {
+                "t": (float(c["start"]) + float(c["end"])) / 2.0,
+                "headline": (c.get("title") or c.get("slug") or "Highlight").upper(),
+                "subhead": "",
+            }
+            for c in clips
+        ],
+    }
+
+
 def main():
-    if len(sys.argv) != 2:
-        sys.exit("usage: thumbnails.py <workdir>")
-    workdir = pathlib.Path(sys.argv[1])
-    spec_path = workdir / "thumbnails.json"
-    if not spec_path.exists():
-        sys.exit("missing " + str(spec_path))
-    spec = json.loads(spec_path.read_text())
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("workdir")
+    ap.add_argument(
+        "--from-edl", action="store_true",
+        help="Build thumbnails from edl.json clips; ignore thumbnails.json.",
+    )
+    args = ap.parse_args()
+
+    workdir = pathlib.Path(args.workdir)
+    if args.from_edl:
+        spec = auto_spec_from_edl(workdir)
+        print("[thumbnails] auto-spec from EDL — {} candidates".format(
+            len(spec["thumbnails"])
+        ))
+    else:
+        spec_path = workdir / "thumbnails.json"
+        if not spec_path.exists():
+            sys.exit(
+                "missing " + str(spec_path)
+                + "\n(or pass --from-edl to derive from edl.json)"
+            )
+        spec = json.loads(spec_path.read_text())
 
     src = workdir / spec.get("source", "source.mp4")
     if not src.exists():

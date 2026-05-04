@@ -48,7 +48,12 @@ import sys
 
 # render_text lives next to this script; make sure it's importable
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from render_text import render_title_card, render_caption, render_end_card
+from render_text import (
+    render_title_card,
+    render_caption,
+    render_caption_active,
+    render_end_card,
+)
 
 
 SLUG_RE = re.compile(r"[^a-zA-Z0-9]+")
@@ -312,7 +317,7 @@ def caption_chunks_for(
     if not in_range:
         return []
 
-    if mode == "word":
+    if mode in ("word", "word_active"):
         # Distribute each phrase's duration evenly across its words.
         words = []
         for i, entry in enumerate(in_range):
@@ -343,11 +348,33 @@ def caption_chunks_for(
                 max_chunks=max_chunks,
             )
         # Ensure each word is on screen for at least min_dur.
-        out = []
         for w in words:
             if w["end"] - w["start"] < min_dur:
                 w["end"] = w["start"] + min_dur
-            out.append(w)
+
+        if mode == "word":
+            return words
+
+        # word_active: build a 3-word context window per chunk, marking
+        # which word is currently active. The window slides — at word i,
+        # show [w[i-1], w[i], w[i+1]] with the middle one highlighted.
+        out = []
+        for i, w in enumerate(words):
+            window = []
+            active_idx = 0
+            if i > 0:
+                window.append(words[i - 1]["text"])
+                active_idx = 1
+            window.append(w["text"])
+            if i + 1 < len(words):
+                window.append(words[i + 1]["text"])
+            out.append({
+                "start": w["start"],
+                "end": w["end"],
+                "text": " ".join(window),
+                "_words": window,
+                "_active_idx": active_idx,
+            })
         return out
 
     # phrase mode (default)
@@ -762,8 +789,18 @@ def render_clip(
     if captions:
         for i, c in enumerate(captions):
             cap_png = work_assets / "cap_{}.png".format(i)
-            img = render_caption(c["text"], out_w, out_h,
-                                 style=caption_style, accent=accent)
+            # word_active mode: chunk has `_words` + `_active_idx` for the
+            # karaoke-style active-highlight renderer.
+            if "_words" in c:
+                img = render_caption_active(
+                    c["_words"], c["_active_idx"], out_w, out_h,
+                    style=caption_style, accent=accent,
+                )
+            else:
+                img = render_caption(
+                    c["text"], out_w, out_h,
+                    style=caption_style, accent=accent,
+                )
             img.save(cap_png)
             inputs += png_input_prefix + ["-i", str(cap_png)]
             prev_label = overlays[-1]

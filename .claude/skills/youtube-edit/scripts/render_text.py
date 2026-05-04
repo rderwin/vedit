@@ -164,6 +164,98 @@ def render_end_card(title, subtitle, cta, width, height, accent="#FFD24A"):
     return img
 
 
+def render_caption_active(words, active_idx, width, height,
+                          style="minimal", accent="#FFD24A"):
+    """Karaoke-style caption — show all `words` on one line, with
+    `words[active_idx]` highlighted.
+
+    Modern TikTok-2024 look: viewer can read along (3-5 word context),
+    the currently-spoken word pops via a colored background pill, and
+    the surrounding words sit in calmer "context" styling.
+
+    Each word renders at the same size; the active word gets a colored
+    pill (or a stroke for `minimal` style). Centered horizontally.
+    """
+    img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    is_vertical = height > width
+
+    if is_vertical:
+        font_size = max(64, int(width * 0.078))
+        center_y_frac = 0.58
+    else:
+        font_size = max(38, int(height * 0.064))
+        center_y_frac = 0.78
+
+    font = _font(font_size)
+    space = max(8, int(font_size * 0.22))
+
+    # Measure each word so we can lay them out and shrink-fit if needed.
+    widths = [draw.textlength(w.upper(), font=font) for w in words]
+    max_text_w = int(width * 0.92)
+
+    # If the words are too wide, drop down a font tier and remeasure.
+    while sum(widths) + space * (len(words) - 1) > max_text_w and font_size > 30:
+        font_size -= 4
+        font = _font(font_size)
+        space = max(6, int(font_size * 0.22))
+        widths = [draw.textlength(w.upper(), font=font) for w in words]
+
+    total_w = sum(widths) + space * (len(words) - 1)
+    x = (width - total_w) // 2
+    line_h = int(font_size * 1.10)
+    y = int(height * center_y_frac) - line_h // 2
+
+    # Style colors.
+    if style == "pop":
+        active_bg = _hex_rgba(accent)[:3] + (245,)
+        active_fg = (16, 16, 18, 255)
+        ctx_fg = (255, 255, 255, 200)
+    elif style == "bold":
+        active_bg = (16, 16, 18, 235)
+        active_fg = (255, 255, 255, 255)
+        ctx_fg = (255, 255, 255, 180)
+    else:  # minimal
+        active_bg = None
+        active_fg = (255, 255, 255, 255)
+        ctx_fg = (255, 255, 255, 165)
+
+    pad_x = int(font_size * 0.30)
+    pad_y = int(font_size * 0.10)
+    radius = int(font_size * 0.28)
+    stroke_w = max(3, int(font_size * 0.075))
+
+    cur_x = x
+    for i, w in enumerate(words):
+        word_text = w.upper()
+        word_w = widths[i]
+        is_active = (i == active_idx)
+        if is_active and active_bg is not None:
+            x1 = cur_x - pad_x
+            y1 = y - pad_y
+            x2 = cur_x + word_w + pad_x
+            y2 = y + font_size + pad_y
+            try:
+                draw.rounded_rectangle((x1, y1, x2, y2),
+                                       radius=radius, fill=active_bg)
+            except Exception:
+                draw.rectangle((x1, y1, x2, y2), fill=active_bg)
+            draw.text((cur_x, y), word_text, fill=active_fg, font=font)
+        elif is_active and style == "minimal":
+            # Active word gets the stroke, context words are plain
+            draw.text((cur_x, y), word_text, fill=active_fg, font=font,
+                      stroke_width=stroke_w, stroke_fill=(0, 0, 0, 255))
+        else:
+            # Context word — softer alpha, optional thin shadow
+            if style == "minimal":
+                draw.text((cur_x + 2, y + 2), word_text,
+                          fill=(0, 0, 0, 160), font=font)
+            draw.text((cur_x, y), word_text, fill=ctx_fg, font=font)
+        cur_x += word_w + space
+
+    return img
+
+
 def render_caption(text, width, height, style="minimal", accent="#FFD24A"):
     """Centered, big, bold short-form caption (TikTok / Reels style).
 
