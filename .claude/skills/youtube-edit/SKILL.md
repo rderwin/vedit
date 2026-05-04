@@ -218,7 +218,7 @@ Outputs in `<workdir>/out/`: `main.mp4`, `clips/NN_slug.mp4`, `clips_vertical/NN
 
 **Style key reference:**
 
-- `vertical_fit` — `blur_fill` (talking-head; doesn't crop the subject), `fill_height` (screen-recorded; center column fills 9:16), or `face_track` (smoothly follows the speaker; requires `crop_track.json` from `smart_crop.py`).
+- `vertical_fit` — `blur_fill` (talking-head; doesn't crop the subject), `fill_height` (screen-recorded; center column fills 9:16), `face_track` (smoothly follows the speaker; requires `crop_track.json` from `smart_crop.py`), or `auto` (heuristic — picks face_track / fill_height / blur_fill based on whether `crop_track.json` shows reliable face motion and the source aspect ratio).
 - `caption_style` — `minimal` (white text + thick black stroke), `bold` (white text on dark rounded pill), `pop` (black text on accent-colored pill, MrBeast-adjacent).
 - `caption_mode` — `phrase` (≤4-word chunks) or `word` (one word per chunk, TikTok-2024 style; falls back to phrase if more than 80 words in a clip).
 - `title_anim` — `fade` (alpha-only) or `slide` (slide in from the left + fade).
@@ -230,7 +230,12 @@ Outputs in `<workdir>/out/`: `main.mp4`, `clips/NN_slug.mp4`, `clips_vertical/NN
 - `stabilize` — runs `deshake` on the source. Single-pass; for shaky footage. Off by default.
 - `beat_sync` — when a `beats.json` is present, snap each main segment's end to the nearest beat. Off by default.
 - `quality` — encoder preset: `fast` (iterate quickly), `balanced` (default), `high` (final delivery), `h265` (smaller files), `archival` (visually lossless).
-- `export_formats` — list of additional aspect ratios to render alongside `main.mp4`. Choices: `square` (1080×1080), `vertical` (1080×1920). One EDL → many deliverables.
+- `export_formats` — list of extra outputs to render alongside `main.mp4`. Choices: `square` (1080×1080), `vertical` (1080×1920), `srt` (sidecar subtitles), `audio` (`main.m4a` for podcast distro). One EDL → many deliverables.
+- `caption_mode` — `phrase` (≤4-word chunks; default), `word` (one word per chunk, TikTok-2024 style), or `word_active` (3-word window with the active word highlighted; the modern karaoke look).
+- `sfx_on_title` — synthesized whoosh accent at each title-in. Off by default.
+- `sfx_on_xfade` — synthesized whoosh accent at each main-segment xfade midpoint. Off by default.
+- `pip_position`, `pip_scale`, `pip_round` — picture-in-picture knobs. Drop a `webcam.mp4` / `cam.mp4` / `pip.mp4` in the workdir and the assembler overlays it on landscape clips and main segments at the configured corner. Skipped on vertical clips (too cramped).
+- `lut` — bundled name (`cinematic`, `warm_vintage`, `cool_noir`, `summer_pop`, `bw_high_contrast`) or path to a `.cube` file. Bundled LUTs in `luts/`.
 - `use_music` — drop a `music.mp3`/`.m4a`/`.wav`/`.ogg` in the workdir; the main compilation gets a sidechain-ducked music bed. See [`MUSIC.md`](MUSIC.md) for legal sources.
 - `audio_clean` — runs `afftdn` (FFT-based denoise) before loudnorm. Default on for podcast/documentary/cinematic presets.
 - `sfx_on_title` — synthesized whoosh accent at the start of each title-in. Default off.
@@ -485,18 +490,26 @@ See [`ROADMAP.md`](ROADMAP.md) for the full landscape of features and the open-s
 **Recently shipped:**
 
 - ✅ Smart vertical face-tracking — `vertical_fit: "face_track"` follows the speaker
+- ✅ `vertical_fit: "auto"` — picks the best mode from the source heuristically
+- ✅ Karaoke captions (`caption_mode: "word_active"`) — TikTok-2024 active-word highlight
 - ✅ Auto-zoom on reaction peaks — subtle kenburns at top loudness peaks
 - ✅ Stabilization — single-pass `deshake`
 - ✅ Beat-synced cuts — librosa beat detection + auto-snap segment ends
-- ✅ Multi-format export — square + vertical alongside main from one EDL
+- ✅ Multi-format export — square + vertical + SRT subtitles + audio-only from one EDL
 - ✅ Quality presets — fast / balanced / high / h265 / archival
-- ✅ Word-level transcription mode (`transcribe.sh --words`) + word captions in EDL
-- ✅ Transcript hygiene (auto-fix mishears like chest → chess)
+- ✅ Picture-in-picture overlay (drop `webcam.mp4` in workdir)
+- ✅ Reverse playback (`speed: -1`)
+- ✅ Sound FX on title-in and xfade transitions
+- ✅ 5 bundled CC0 3D LUTs (cinematic / warm_vintage / cool_noir / summer_pop / bw_high_contrast)
+- ✅ Anthropic-SDK picker (`claude_pick.py`) for unattended runs
+- ✅ Watch-folder mode (`watch.sh`) — drop URLs into a text file, pipeline runs them
+- ✅ One-command quickstart (`quickstart.sh URL`) — download → transcribe → fix → analyze → auto-EDL
+- ✅ Cookbook of working sample EDLs ([`EXAMPLES.md`](EXAMPLES.md))
 
 **On the way (see ROADMAP.md):**
 
-- ⏳ Speaker diarization labels (pyannote / WhisperX)
+- ⏳ Speaker diarization labels (WhisperX integration)
 - ⏳ Two-pass `vidstab` (better than `deshake`; needs custom-built ffmpeg)
-- ⏳ 3D LUT presets shipped with the skill (free CC0 LUTs bundled)
-- ⏳ Local LLM picker (ollama / llama3.1 reads transcript+signals → starter EDL)
-- ⏳ Auto-upload to YouTube / TikTok / Shorts
+- ⏳ Caption translation (argos-translate / LibreTranslate)
+- ⏳ AI voiceover for narration (Piper TTS)
+- ⏳ Auto-upload to YouTube / TikTok / Shorts (OAuth flows)
