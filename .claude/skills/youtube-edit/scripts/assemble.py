@@ -997,11 +997,15 @@ def render_clip(
 
 
 def assemble_main(parts, out, durations, xfade=0.5, music_path=None,
-                  transitions=None, quality="balanced"):
+                  transitions=None, quality="balanced", sfx_on_xfade=False):
     """Concatenate `parts` (mp4 paths) with xfade + acrossfade transitions.
 
     `transitions[i]` is the xfade type to use *between part i-1 and part i*.
     Index 0 is unused. Defaults to "fade" everywhere.
+
+    `sfx_on_xfade=True` mixes a synthesized whoosh tone in at the midpoint
+    of each xfade — adds polish to long compilations without needing an
+    SFX asset library.
     """
     inputs = []
     for p in parts:
@@ -1013,6 +1017,19 @@ def assemble_main(parts, out, durations, xfade=0.5, music_path=None,
         # -stream_loop -1 makes ffmpeg loop the input file indefinitely so
         # the bed covers the whole compilation regardless of music length.
         inputs += ["-stream_loop", "-1", "-i", str(music_path)]
+
+    # SFX input — generated tone we'll split + delay across the xfade
+    # midpoints. Skip if there are no xfades to fire on.
+    sfx_idx = None
+    if sfx_on_xfade and len(parts) > 1:
+        sfx_idx = (
+            (music_idx + 1) if music_idx is not None else len(parts)
+        )
+        inputs += [
+            "-f", "lavfi",
+            "-t", "0.5",
+            "-i", "sine=frequency=320:duration=0.5:sample_rate=44100",
+        ]
 
     if len(parts) == 1 and music_idx is None:
         # Fast path — single part, no music — keep video stream copy.
@@ -1033,6 +1050,7 @@ def assemble_main(parts, out, durations, xfade=0.5, music_path=None,
     chain_parts = []
     cumulative = durations[0]
     transitions = transitions or []
+    xfade_midpoints = []  # output-time seconds for SFX firing
     for i in range(1, len(parts)):
         offset = cumulative - xfade
         new_v = "[v{}]".format(i)
@@ -1050,14 +1068,50 @@ def assemble_main(parts, out, durations, xfade=0.5, music_path=None,
                 prev=a_label, i=i, d=xfade, na=new_a,
             )
         )
+        xfade_midpoints.append(offset + xfade / 2)
         v_label = new_v
         a_label = new_a
         cumulative += durations[i] - xfade
 
+    # Build the SFX side-chain — generates one tone, splits it into K
+    # streams, delays each to its xfade midpoint, mixes the lot into one
+    # [sfx_all] stream. K = number of xfades.
+    sfx_label = None
+    if sfx_idx is not None and xfade_midpoints:
+        K = len(xfade_midpoints)
+        env = (
+            "[{}:a]atrim=duration=0.4,"
+            "afade=t=in:st=0:d=0.04,afade=t=out:st=0.30:d=0.10".format(sfx_idx)
+        )
+        if K == 1:
+            ms = int(round(xfade_midpoints[0] * 1000))
+            chain_parts.append(
+                "{e},adelay={ms}|{ms},volume=0.4[sfx_all]".format(e=env, ms=ms)
+            )
+        else:
+            split_outs = "".join("[sfx_s{}]".format(j) for j in range(K))
+            chain_parts.append("{e},asplit={k}{outs}".format(
+                e=env, k=K, outs=split_outs,
+            ))
+            for j, mid_t in enumerate(xfade_midpoints):
+                ms = int(round(mid_t * 1000))
+                chain_parts.append(
+                    "[sfx_s{j}]adelay={ms}|{ms},volume=0.4[sfx_d{j}]".format(
+                        j=j, ms=ms,
+                    )
+                )
+            mix_inputs = "".join("[sfx_d{}]".format(j) for j in range(K))
+            chain_parts.append(
+                "{m}amix=inputs={k}:duration=longest:normalize=0[sfx_all]".format(
+                    m=mix_inputs, k=K,
+                )
+            )
+        sfx_label = "[sfx_all]"
+
     if music_idx is not None:
         # Split the voice into two streams: one for the mix, one as the
-        # sidechain trigger that ducks the music. Mix voice + ducked music,
-        # then loudnorm the result.
+        # sidechain trigger that ducks the music. Mix voice + ducked music
+        # (+ SFX if enabled), then loudnorm the result.
         chain_parts.append(
             "{prev}asplit=2[voice_a][voice_sc]".format(prev=a_label)
         )
@@ -1070,12 +1124,28 @@ def assemble_main(parts, out, durations, xfade=0.5, music_path=None,
             "[music_in][voice_sc]sidechaincompress="
             "threshold=0.03:ratio=10:attack=5:release=400:level_sc=4[music_duck]"
         )
+        if sfx_label:
+            chain_parts.append(
+                "[voice_a][music_duck]{sfx}amix=inputs=3:duration=first:"
+                "weights=1.0 0.65 0.7,{ln}[aout]".format(
+                    sfx=sfx_label, ln=LOUDNORM_MAIN,
+                )
+            )
+        else:
+            chain_parts.append(
+                "[voice_a][music_duck]amix=inputs=2:duration=first:"
+                "weights=1.0 0.65,{ln}[aout]".format(ln=LOUDNORM_MAIN)
+            )
+    elif sfx_label:
+        # No music, but SFX — mix voice + SFX, then loudnorm.
         chain_parts.append(
-            "[voice_a][music_duck]amix=inputs=2:duration=first:"
-            "weights=1.0 0.65,{ln}[aout]".format(ln=LOUDNORM_MAIN)
+            "{prev}{sfx}amix=inputs=2:duration=first:"
+            "weights=1.0 0.7,{ln}[aout]".format(
+                prev=a_label, sfx=sfx_label, ln=LOUDNORM_MAIN,
+            )
         )
     else:
-        # No music — just loudnorm the voice stream directly.
+        # No music, no SFX — just loudnorm the voice stream directly.
         chain_parts.append("{prev}{ln}[aout]".format(prev=a_label, ln=LOUDNORM_MAIN))
     a_label = "[aout]"
 
@@ -1138,6 +1208,7 @@ def main():
         sys.exit("unknown quality preset: {!r} (valid: {})".format(
             default_quality, ", ".join(sorted(QUALITY_PRESETS))))
     default_beat_sync = bool(style.get("beat_sync", False))
+    default_sfx_on_xfade = bool(style.get("sfx_on_xfade", False))
 
     # Load signals.json (used for auto-zoom peaks).
     signals = {}
@@ -1331,7 +1402,8 @@ def main():
         main_out = out_dir / "main.mp4"
         assemble_main(parts, main_out, durations,
                       music_path=music_path, transitions=transitions,
-                      quality=default_quality)
+                      quality=default_quality,
+                      sfx_on_xfade=default_sfx_on_xfade)
         print("main → {}".format(main_out))
 
         # Optional alternate-aspect exports + sidecar files for the main.
