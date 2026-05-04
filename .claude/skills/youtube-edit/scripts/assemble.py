@@ -775,6 +775,7 @@ def render_clip(
     stings=None,
     sfx_dir=None,
     text_overlays=None,
+    cutaways=None,
 ):
     """Render one polished clip. Returns the output path."""
     dur = end - start
@@ -876,6 +877,48 @@ def render_clip(
         "-loop", "1", "-framerate", str(fps),
         "-t", "{:.3f}".format(eff_dur),
     ]
+
+    # Cutaways — insert an image over the source for [t, t+dur].
+    # Captions / overlays / title still render on top so the cutaway feels
+    # like the "video" is showing the cutaway image briefly.
+    if cutaways:
+        for j, cut in enumerate(cutaways):
+            src_path = cut.get("src")
+            if not src_path:
+                continue
+            src_p = pathlib.Path(src_path)
+            if not src_p.is_absolute():
+                # Resolve relative to workdir (one level up from work_assets).
+                src_p = work_assets.parent.parent.parent / src_path
+            if not src_p.exists():
+                print("[cutaway] missing src '{}' — skipping".format(src_path))
+                continue
+            t_in = float(cut.get("t", 0)) / speed
+            t_out = t_in + float(cut.get("dur", cut.get("duration", 1.5))) / speed
+            # Loop the still image as a video stream for the cutaway duration.
+            inputs += [
+                "-loop", "1", "-framerate", str(fps),
+                "-t", "{:.3f}".format(eff_dur),
+                "-i", str(src_p),
+            ]
+            # Scale the cutaway image to fill the canvas; center-crop overflow.
+            new_label = "[cut{}]".format(j)
+            full_chain += (
+                ";[{idx}:v]scale={W}:{H}:force_original_aspect_ratio=increase,"
+                "crop={W}:{H},setsar=1[cut_in_{j}];"
+                "{prev}[cut_in_{j}]overlay=0:0:format=auto:"
+                "enable='between(t,{a},{b})'{nl}"
+            ).format(
+                idx=next_input_idx,
+                W=out_w, H=out_h,
+                j=j,
+                prev=overlays[-1],
+                a=round(t_in, 3),
+                b=round(t_out, 3),
+                nl=new_label,
+            )
+            overlays.append(new_label)
+            next_input_idx += 1
 
     # Caption overlays (captions list of {start,end,text} relative to clip).
     # Caption timestamps are in source seconds; the output's `t` coordinate
@@ -1694,6 +1737,7 @@ def main():
             stings=clip.get("stings"),
             sfx_dir=workdir / "sfx",
             text_overlays=clip.get("overlays"),
+            cutaways=clip.get("cutaways"),
         )
         print("clip → {}".format(clips_dir / name))
 
@@ -1736,6 +1780,7 @@ def main():
                 stings=clip.get("stings"),
                 sfx_dir=workdir / "sfx",
                 text_overlays=clip.get("overlays"),
+                cutaways=clip.get("cutaways"),
             )
             print("clip → {}".format(vert_dir / name))
 

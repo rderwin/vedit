@@ -252,6 +252,7 @@ Outputs in `<workdir>/out/`: `main.mp4`, `clips/NN_slug.mp4`, `clips_vertical/NN
 - `captions: true|false` per clip. Default on for vertical, off for landscape.
 - `stings: [{t, name, volume?}]` — comedy sound stings mixed at clip-relative `t` seconds. Built-in `name`s: `boom`, `airhorn`, `riser`, `pop`, `ding`, `trombone`. Drop a wav at `<workdir>/sfx/<name>.wav` to override or add new ones (e.g. a real vine-boom mp3).
 - `overlays: [{t, dur, text, position?, style?, accent?, font_scale?}]` — free-form text overlays at clip-relative `t`. `position` is one of `top_left`, `top_center`, `top_right`, `mid_left`, `center`, `mid_right`, `bot_left`, `bot_center`, `bot_right`. `style` is `comment` (narrator-voice default — soft white with shadow), `pop` (accent pill), `bold` (dark pill), or `minimal` (white with stroke). Use ASCII glyphs (`<--`, `=>`) rather than `←` `→` — the bundled fonts don't include arrow chars.
+- `cutaways: [{t, dur, src}]` — replace the source video with `src` (a JPG/PNG path, relative to workdir) for `dur` seconds at clip-relative time `t`. Audio continues from the source. Captions, overlays, title, and logo still composite on top — the cutaway is a "background swap", not a full layer take-over. Use for reaction shots, ironic visuals, screenshots, meme images dropped in at the punchline.
 
 ---
 
