@@ -338,6 +338,7 @@ def caption_chunks_for(
     mode="phrase",
     drop_fillers=False,
     max_chunks=80,
+    show_speaker_labels=False,
 ):
     """Find transcript phrases inside [start, end] and chunk them for captions.
 
@@ -349,6 +350,20 @@ def caption_chunks_for(
     in_range = [t for t in transcript if start <= t["start"] < end]
     if not in_range:
         return []
+
+    # Speaker-label prefixing — prepend "[ALICE]" to the first entry of
+    # each speaker block (only on speaker change, not every line).
+    if show_speaker_labels:
+        new_in_range = []
+        last_speaker = None
+        for entry in in_range:
+            e = dict(entry)
+            spk = e.get("speaker")
+            if spk and spk != last_speaker:
+                e["text"] = "[{}] {}".format(spk.upper(), e["text"])
+                last_speaker = spk
+            new_in_range.append(e)
+        in_range = new_in_range
 
     if mode in ("word", "word_active"):
         # Distribute each phrase's duration evenly across its words.
@@ -1243,6 +1258,16 @@ def main():
     default_sfx_on_title = bool(style.get("sfx_on_title", False))
     default_auto_zoom = bool(style.get("auto_zoom", False))
     default_stabilize = bool(style.get("stabilize", False))
+    show_speaker_labels = bool(style.get("show_speaker_labels", False))
+    # Optional speaker map: {"SPEAKER_00": "ALICE", "SPEAKER_01": "BOB"}
+    speaker_map = style.get("speaker_map") or {}
+    if show_speaker_labels and speaker_map and transcript:
+        # Apply rename in-place on the loaded transcript so all downstream
+        # caption-chunk calls see the friendly names.
+        for e in transcript:
+            spk = e.get("speaker")
+            if spk and spk in speaker_map:
+                e["speaker"] = speaker_map[spk]
     default_quality = style.get("quality", "balanced")
     if default_quality not in QUALITY_PRESETS:
         sys.exit("unknown quality preset: {!r} (valid: {})".format(
@@ -1549,6 +1574,7 @@ def main():
                 caption_chunks_for(
                     transcript, start, end,
                     mode=cap_mode, drop_fillers=drop_fillers,
+                    show_speaker_labels=show_speaker_labels,
                 ) if do_caps else None
             )
             v_fit = clip.get("vertical_fit", default_vertical_fit)

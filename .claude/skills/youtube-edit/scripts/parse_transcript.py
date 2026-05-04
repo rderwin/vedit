@@ -114,6 +114,30 @@ def main():
         transcript = dedupe_rolling(cues)
     else:
         transcript = dedupe_simple(cues)
+    # Attach speaker labels from speaker_labels.json (produced by
+    # transcribe_x.py with HF_TOKEN set). For each transcript entry,
+    # find the speaker whose segment range contains the entry's start.
+    sl_path = workdir / "speaker_labels.json"
+    if sl_path.exists():
+        try:
+            speaker_segments = json.loads(sl_path.read_text())
+        except Exception:
+            speaker_segments = []
+        speakers_attached = 0
+        for e in transcript:
+            t = float(e["start"])
+            for seg in speaker_segments:
+                if float(seg["start"]) <= t <= float(seg["end"]):
+                    e["speaker"] = seg["speaker"]
+                    speakers_attached += 1
+                    break
+        if speakers_attached:
+            unique = len(set(e.get("speaker") for e in transcript if e.get("speaker")))
+            print(
+                "[parse] attached speaker labels to {} entries "
+                "({} unique speakers)".format(speakers_attached, unique)
+            )
+
     out = workdir / "transcript.json"
     out.write_text(json.dumps(transcript, indent=2))
     if transcript:
