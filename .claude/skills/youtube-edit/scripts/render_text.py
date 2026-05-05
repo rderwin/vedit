@@ -284,10 +284,12 @@ def render_caption_active(words, active_idx, width, height,
 
     if is_vertical:
         font_size = max(64, int(width * 0.078))
-        center_y_frac = 0.58
+        # Sit below the video in blur_fill layout (16:9 source centered in
+        # 9:16 canvas leaves the bottom ~34% as blurred letterbox).
+        center_y_frac = 0.86
     else:
         font_size = max(38, int(height * 0.064))
-        center_y_frac = 0.78
+        center_y_frac = 0.88
 
     font = _font(font_size)
     space = max(8, int(font_size * 0.22))
@@ -410,10 +412,11 @@ def render_caption(text, width, height, style="minimal", accent="#FFD24A",
 
     if is_vertical:
         font_size = max(72, int(width * 0.085))
-        center_y_frac = 0.58
+        # Sit below the video in blur_fill layout — see render_caption_active.
+        center_y_frac = 0.86
     else:
         font_size = max(40, int(height * 0.070))
-        center_y_frac = 0.78
+        center_y_frac = 0.88
 
     if emphasis:
         font_size = int(font_size * 1.25)

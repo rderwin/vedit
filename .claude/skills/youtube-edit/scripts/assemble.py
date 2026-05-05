@@ -402,7 +402,13 @@ def caption_chunks_for(
         in_range = new_in_range
 
     if mode in ("word", "word_active"):
-        # Distribute each phrase's duration evenly across its words.
+        # Whisper aligns to phrase boundaries — individual word starts within
+        # a phrase are evenly-distributed approximations, which makes karaoke
+        # captions read as "behind" the speech. Shift everything ~120ms earlier
+        # so the caption lands as the word is being spoken, not after.
+        # WhisperX users get true word-level timestamps and can lower this to
+        # ~30ms via `transcript[i].word_starts` (not yet wired here).
+        caption_lead = 0.12
         words = []
         for i, entry in enumerate(in_range):
             next_start = in_range[i + 1]["start"] if i + 1 < len(in_range) else end
@@ -411,7 +417,7 @@ def caption_chunks_for(
                 continue
             wdur = (next_start - entry["start"]) / len(ws)
             for k, w in enumerate(ws):
-                t0 = entry["start"] + k * wdur - start
+                t0 = entry["start"] + k * wdur - start - caption_lead
                 if drop_fillers and _is_filler(w):
                     continue
                 words.append({
@@ -507,15 +513,20 @@ def caption_chunks_for(
     return out
 
 
-def zoom_expression(peaks, *, max_zoom=1.06, dur=0.8):
+def zoom_expression(peaks, *, max_zoom=1.08, up_dur=0.15,
+                    hold=0.20, down_dur=0.50):
     """Build a time-varying zoom factor for ffmpeg's `zoompan` filter.
+
+    Asymmetric envelope: snap up fast, hold, decay slow. Reads as the
+    editor reacting to an audio beat (laugh / exclamation lands → snap
+    zoom-in → hold the moment → ease back out) rather than the previous
+    symmetric Ken Burns ramp, which felt like the camera was breathing
+    in and out for no reason.
 
     zoompan is the only filter that supports per-frame zoom evaluation.
     Its expression uses `time` (output timestamp in seconds), NOT `t`.
-
-    Each peak ramps zoom up to `max_zoom` over `dur/2` seconds then back
-    down over `dur/2`. Multiple peaks combine via max so overlaps just
-    hold the highest zoom rather than compounding.
+    Multiple peaks combine via max so overlaps just hold the highest zoom
+    rather than compounding.
 
     Backslashes escape commas so the expression sits cleanly inside a
     filter argument without being split on commas.
@@ -523,19 +534,27 @@ def zoom_expression(peaks, *, max_zoom=1.06, dur=0.8):
     if not peaks:
         return "1"
     delta = max_zoom - 1.0
-    triangles = [
-        "max(0\\,1-2*abs(time-{:.3f})/{:.3f})".format(float(p), float(dur))
-        for p in peaks
-    ]
-    summed = "+".join(triangles)
+    envs = []
+    for p in peaks:
+        t = float(p)
+        # max(0, min((time-t+up)/up, 1, 1-(time-t-hold)/down))
+        env = (
+            "max(0\\,min((time-{t:.3f}+{u:.3f})/{u:.3f}\\,"
+            "min(1\\,1-(time-{t:.3f}-{h:.3f})/{d:.3f})))"
+        ).format(t=t, u=up_dur, h=hold, d=down_dur)
+        envs.append(env)
+    summed = "+".join(envs)
     return "1+{:.4f}*min(1\\,{})".format(delta, summed)
 
 
-def peaks_inside_clip(signals, start, end, *, top_n=3, min_lufs=-25.0):
+def peaks_inside_clip(signals, start, end, *, top_n=2, min_lufs=-22.0):
     """Pick up to `top_n` loudness peaks that fall inside [start, end].
 
     Returns peak times relative to the clip start. Filters out peaks
-    quieter than `min_lufs` (don't zoom on background noise).
+    quieter than `min_lufs` so we only zoom on actual exclamations /
+    laughs / impacts — not background mumbling. With the new asymmetric
+    zoom envelope (fast in, hold, slow out, ~0.85s total), 2 peaks per
+    clip is the sweet spot — more than that and the zoom oscillates.
     """
     peaks = []
     for p in (signals or {}).get("loud_peaks") or []:
